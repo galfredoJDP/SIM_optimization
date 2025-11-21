@@ -1,10 +1,10 @@
 import torch
 import numpy as np
 from typing import Optional, Dict, Union
-from wireless.sim import sim
-from wireless.transceiver import Transceiver
-from wireless.channel import UserChannel
-from util.util import rayleighSommerfeld
+from simpy.sim import Sim
+from simpy.transceiver import Transceiver
+from simpy.channel import UserChannel
+from simpy.util.util import rayleighSommerfeld
 
 
 class Beamformer(Transceiver, UserChannel):
@@ -33,7 +33,7 @@ class Beamformer(Transceiver, UserChannel):
                  min_user_distance: float = 10.0,
                  max_user_distance: float = 100.0,
                  # SIM
-                 sim_model: Optional[sim] = None,
+                 sim_model: Optional[Sim] = None,
                  # System parameters
                  noise_power: float = 1e-10,
                  total_power: float = 1.0,
@@ -67,7 +67,7 @@ class Beamformer(Transceiver, UserChannel):
         Transceiver.__init__(self, Nx, Ny, wavelength, max_scan_angle, device)
         UserChannel.__init__(self, num_users, wavelength, reference_distance,
                             path_loss_at_reference, min_user_distance,
-                            max_user_distance, device)
+                            max_user_distance, ricean_k_factors=None, device=device)
 
         # Set user positions if provided
         if user_positions is not None:
@@ -148,7 +148,7 @@ class Beamformer(Transceiver, UserChannel):
             H_eff = torch.conj(H_eff).T #Hermittian for uplink, assume reciprocity
         return H_eff
 
-    def compute_sinr(self, 
+    def compute_sinr(self,
                      phases: torch.Tensor = None, #the SIM weights
                      power_allocation: Optional[torch.Tensor] = None,
                      digital_beamforming_weights : Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -162,15 +162,18 @@ class Beamformer(Transceiver, UserChannel):
         Returns:
             sinr: (K,) SINR for each user
         """
-        
+
         H_eff = self.compute_end_to_end_channel(phases) #here you get Psi if needed , else return H directly
-        
+
+        # Save the channel before digital weights are applied
+        self.pre_digital_weights_channel = H_eff
+
         # Default: equal power allocation
         if power_allocation is None:
             power_allocation = torch.ones(self.num_users, device=self.device)
             power_allocation *= (self.total_power / self.num_users)
 
-        # Compute SINR
+        # Compute SINR (this will save last_effective_channel in compute_sinr_downlink)
         sinr = self.compute_sinr_downlink(H_eff, power_allocation, self.noise_power, digital_beamforming_weights)  # From Transceiver
         return sinr
 

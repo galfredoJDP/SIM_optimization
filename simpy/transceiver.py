@@ -200,6 +200,9 @@ class Transceiver:
         else:
             effective_channel = channel
 
+        # Save the effective channel used for this computation
+        self.last_effective_channel = effective_channel
+
         K = channel.shape[0]  # Number of users
 
         # Compute signal and interference powers

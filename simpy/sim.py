@@ -4,10 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as func
 import numpy as np
 from typing import List, Union
-from util.util import findDistance
+from simpy.util.util import findDistance
 
 
-class sim(object):
+class Sim(object):
     def __init__(self, layers: int, metaAtoms: int, layerSpacing: float,
                  metaAtomSpacing: float, metaAtomArea: float, wavelength: float, device : str) -> None:
         """

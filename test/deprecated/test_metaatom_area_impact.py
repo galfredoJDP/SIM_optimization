@@ -6,8 +6,8 @@ on channel characteristics and sum-rate performance.
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from wireless.sim import sim
-from Beamformer import Beamformer
+from simpy.sim import Sim
+from simpy.beamformer import Beamformer
 
 # Set random seed
 np.random.seed(42)
@@ -78,7 +78,7 @@ print("-"*70)
 for idx, (lam_frac, size, area) in enumerate(zip(lambda_fractions, metaatom_sizes, metaatom_areas)):
 
     # Create SIM with this meta-atom area
-    sim_model = sim(
+    sim_model = Sim(
         layers=sim_layers,
         metaAtoms=sim_metaatoms,
         layerSpacing=sim_layer_spacing,

@@ -1,11 +1,11 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from sim import sim
-from transceiver import Transceiver
-from channel import UserChannel
-from algorithm import ProjectedGradientAscent
-from util.util import rayleighSommerfeld
+from simpy.sim import Sim
+from simpy.transceiver import Transceiver
+from simpy.channel import UserChannel
+from simpy.algorithm import ProjectedGradientAscent
+from simpy.util.util import rayleighSommerfeld
 
 print("=" * 70)
 print("Projected Gradient Ascent Test: SIM Phase Optimization")
@@ -31,13 +31,14 @@ print(f"   Transceiver: {transceiver.num_antennas} antennas")
 
 # ========== 2. Create SIM ==========
 print("\n2. Creating SIM...")
-sim_model = sim(
+sim_model = Sim(
     layers=3,
     metaAtoms=8,
     layerSpacing=wavelength / 2,
     metaAtomSpacing=wavelength / 2,
     metaAtomArea=(wavelength / 4)**2,
-    wavelength=wavelength
+    wavelength=wavelength,
+    device='cpu'
 )
 print(f"   SIM: {sim_model.layers} layers, {sim_model.metaAtoms} meta-atoms per layer")
 

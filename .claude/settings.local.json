@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -c:*)",
+      "Bash(bash -l -c \"conda activate torchm && python test/test_beamformer_flow.py\")",
+      "Bash(/opt/homebrew/anaconda3/envs/torchm/bin/python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

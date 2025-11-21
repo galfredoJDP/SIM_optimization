@@ -1,0 +1,254 @@
+import torch
+import numpy as np
+from typing import Optional, Dict, Union
+from wireless.sim import sim
+from wireless.transceiver import Transceiver
+from wireless.channel import UserChannel
+from util.util import rayleighSommerfeld
+
+
+class Beamformer(Transceiver, UserChannel):
+    """
+    Complete digital beamforming system with SIM.
+
+    Inherits from both Transceiver and UserChannel, combining all their
+    functionality into a unified interface.
+
+    Architecture:
+        Antennas → [A] → SIM [Ψ(phases)] → [H] → Users
+    """
+
+    def __init__(self,
+                 # Transceiver parameters
+                 Nx: int,
+                 Ny: int,
+                 wavelength: float,
+                 max_scan_angle: float = 0.0,
+                 device: str = 'cpu',
+                 # UserChannel parameters
+                 num_users: int = 1,
+                 user_positions: Optional[np.ndarray] = None,
+                 reference_distance: float = 1.0,
+                 path_loss_at_reference: float = -30.0,
+                 min_user_distance: float = 10.0,
+                 max_user_distance: float = 100.0,
+                 # SIM
+                 sim_model: Optional[sim] = None,
+                 # System parameters
+                 noise_power: float = 1e-10,
+                 total_power: float = 1.0,
+                 beamforming_method: Optional[str] = None,
+                 use_nearfield_user_channel: bool = False):
+        """
+        Initialize Digital Beamformer system.
+
+        Args:
+            Nx: Number of antenna elements in x-direction
+            Ny: Number of antenna elements in y-direction
+            wavelength: Operating wavelength (meters)
+            max_scan_angle: Maximum beam scan angle (degrees)
+            device: Torch device ('cpu', 'cuda', 'mps')
+            num_users: Number of users (K)
+            user_positions: (K, 3) array of user positions [x, y, z]
+            reference_distance: Reference distance for path loss model (meters)
+            path_loss_at_reference: Path loss at reference distance (dB)
+            min_user_distance: Minimum user distance for CLT mode (meters)
+            max_user_distance: Maximum user distance for CLT mode (meters)
+            sim_model: SIM object (metasurface)
+            noise_power: Noise power σ² (Watts)
+            total_power: Total transmit power (Watts)
+            beamforming_method: Beamforming method ('zf', 'mrt', or None for SIM-only)
+                               None: SIM phases do all beamforming (no digital weights)
+                               'zf': Zero-forcing digital beamforming after SIM
+                               'mrt': Maximum ratio transmission after SIM
+            use_nearfield_user_channel: Use Rayleigh-Sommerfeld for user channel
+        """
+        # Initialize parent classes
+        Transceiver.__init__(self, Nx, Ny, wavelength, max_scan_angle, device)
+        UserChannel.__init__(self, num_users, wavelength, reference_distance,
+                            path_loss_at_reference, min_user_distance,
+                            max_user_distance, device)
+
+        # Set user positions if provided
+        if user_positions is not None:
+            UserChannel.set_user_positions(self, user_positions)
+
+        # DigitalBeamformer-specific attributes
+        self.sim_model = sim_model
+        self.noise_power = noise_power
+        self.total_power = total_power
+        self.beamforming_method = beamforming_method
+        self.use_nearfield_user_channel = use_nearfield_user_channel
+
+        # Precompute static channels if SIM is provided
+        if sim_model is not None:
+            self._compute_static_channels()
+        else:
+            self.H = self.generate_channel(self.get_positions(), time=0.0)
+
+    def _compute_static_channels(self):
+        """
+        Precompute static channel matrices A and H.
+
+        A: Antenna → SIM first layer (doesn't change)
+        H: SIM last layer → Users (can be time-varying)
+        """
+        # Channel A: Antenna → SIM first layer (Rayleigh-Sommerfeld)
+        antenna_positions = self.get_positions().cpu().numpy()  # From Transceiver
+        sim_first_layer = self.sim_model.get_first_layer_positions().cpu().numpy()
+
+        self.A = rayleighSommerfeld(
+            antenna_positions,
+            sim_first_layer,
+            self.wavelength,
+            self.sim_model.metaAtomArea,
+            self.device
+        )
+
+        # Channel H: SIM last layer → Users
+        sim_last_layer = self.sim_model.get_last_layer_positions()
+
+        if self.use_nearfield_user_channel:
+            # Near-field: Use Rayleigh-Sommerfeld
+            user_positions = self.user_positions  # From UserChannel
+            self.H = rayleighSommerfeld(
+                sim_last_layer.cpu().numpy(),
+                user_positions,
+                self.wavelength,
+                self.sim_model.metaAtomArea,
+                self.device
+            )
+        else:
+            # Far-field: Use statistical channel model
+            self.H = self.generate_channel(sim_last_layer, time=0.0)  # From UserChannel
+
+    def update_user_channel(self, time: float = 0.0):
+        """Update user channel H for time-varying channels with mobility."""
+        if not self.use_nearfield_user_channel:
+            sim_last_layer = self.sim_model.get_last_layer_positions()
+            self.H = self.generate_channel(sim_last_layer, time=time)  # From UserChannel
+
+    def compute_end_to_end_channel(self, phases: torch.Tensor = None, direction : str = 'down') -> torch.Tensor:
+        """
+        Compute end-to-end channel: H_eff = H @ Ψ @ A
+
+        Args:
+            phases: (L, N) SIM phase configuration
+
+        Returns:
+            H_eff: (K, A) end-to-end channel from antennas to users
+        """
+        if phases is not None:
+            self.sim_model.update_phases(phases)
+            Psi = self.sim_model.simChannel()
+            H_eff = self.H @ Psi @ self.A
+        else:
+            H_eff = self.H
+        if direction == 'up':
+            H_eff = torch.conj(H_eff).T #Hermittian for uplink, assume reciprocity
+        return H_eff
+
+    def compute_sinr(self, 
+                     phases: torch.Tensor = None, #the SIM weights
+                     power_allocation: Optional[torch.Tensor] = None,
+                     digital_beamforming_weights : Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute SINR for each user with given SIM phases.
+
+        Args:
+            phases: (L, N) SIM phase configuration
+            power_allocation: (K,) power allocation. If None, uses equal power.
+
+        Returns:
+            sinr: (K,) SINR for each user
+        """
+        
+        H_eff = self.compute_end_to_end_channel(phases) #here you get Psi if needed , else return H directly
+        
+        # Default: equal power allocation
+        if power_allocation is None:
+            power_allocation = torch.ones(self.num_users, device=self.device)
+            power_allocation *= (self.total_power / self.num_users)
+
+        # Compute SINR
+        sinr = self.compute_sinr_downlink(H_eff, power_allocation, self.noise_power, digital_beamforming_weights)  # From Transceiver
+        return sinr
+
+    def compute_sum_rate(self, phases: torch.Tensor,
+                        power_allocation: Optional[torch.Tensor] = None,
+                        digital_beamforming_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute sum-rate: Σ log₂(1 + SINR_k)
+
+        Args:
+            phases: (L, N) SIM phase configuration
+            power_allocation: (K,) power allocation
+
+        Returns:
+            sum_rate: Scalar tensor (bits/s/Hz)
+        """
+        sinr = self.compute_sinr(phases, power_allocation, digital_beamforming_weights)
+        rates = torch.log2(1 + sinr)
+        return torch.sum(rates)
+
+    def compute_per_user_rates(self, phases: torch.Tensor,
+                               power_allocation: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Compute per-user rates."""
+        sinr = self.compute_sinr(phases, power_allocation)
+        return torch.log2(1 + sinr)
+
+    def evaluate_performance(self, phases: torch.Tensor,
+                            power_allocation: Optional[torch.Tensor] = None) -> Dict:
+        """
+        Comprehensive performance evaluation.
+
+        Returns:
+            Dictionary with 'sinr', 'sinr_db', 'rates', 'sum_rate'
+        """
+        sinr = self.compute_sinr(phases, power_allocation)
+        rates = torch.log2(1 + sinr)
+
+        return {
+            'sinr': sinr,
+            'sinr_db': 10 * torch.log10(sinr),
+            'rates': rates,
+            'sum_rate': torch.sum(rates)
+        }
+
+    def get_objective_function(self, objective_type: str = 'sum_rate'):
+        """
+        Get objective function for optimization.
+
+        Args:
+            objective_type: 'sum_rate', 'min_rate', or 'proportional_fair'
+
+        Returns:
+            Callable: f(phases) -> scalar
+        """
+        if objective_type == 'sum_rate':
+            return lambda phases: self.compute_sum_rate(phases)
+        elif objective_type == 'min_rate':
+            return lambda phases: torch.min(self.compute_per_user_rates(phases))
+        elif objective_type == 'proportional_fair':
+            return lambda phases: torch.sum(torch.log(self.compute_per_user_rates(phases) + 1e-8))
+        else:
+            raise ValueError(f"Unknown objective type: {objective_type}")
+
+    def get_system_info(self) -> Dict:
+        """Get system information."""
+        info = {
+            'num_antennas': self.num_antennas,
+            'num_users': self.num_users,
+            'wavelength': self.wavelength,
+            'noise_power': self.noise_power,
+            'total_power': self.total_power,
+            'beamforming_method': self.beamforming_method,
+        }
+        if self.sim_model is not None:
+            info.update({
+                'sim_layers': self.sim_model.layers,
+                'sim_metaatoms': self.sim_model.metaAtoms,
+                'channel_A_shape': tuple(self.A.shape),
+                'channel_H_shape': tuple(self.H.shape)
+            })
+        return info

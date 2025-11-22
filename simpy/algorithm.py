@@ -1,122 +1,201 @@
 import torch
 import numpy as np
 from typing import Callable, Optional, Dict, List
-from sim import sim
+from simpy.sim import Sim
+from simpy.beamformer import Beamformer
 
 
 class ProjectedGradientAscent:
     """
-    Projected Gradient Ascent (PGA) for SIM phase optimization.
+    Generic Projected Gradient Ascent (PGA) optimizer.
 
-    Optimizes SIM meta-atom phases to maximize an objective function
-    (e.g., sum-rate, SINR) subject to phase constraints [0, 2À].
+    Optimizes any differentiable parameters to maximize an objective function
+    subject to constraints via projection.
+
+    Supports:
+        - SIM phases: [0, 2Ï€] constraints
+        - Digital beamforming weights: Normalization constraints
+        - Power allocation: Sum and non-negativity constraints
+        - Any custom parameters with custom projections
 
     Algorithm:
-        1. Compute gradient of objective w.r.t. phases
-        2. Update: phases_new = phases_old + step_size * gradient
-        3. Project: phases_new = mod(phases_new, 2À)
+        1. Compute gradient of objective w.r.t. parameters
+        2. Update: params_new = params_old + step_size * gradient
+        3. Project: params_new = projection_fn(params_new)
         4. Repeat until convergence or max iterations
     """
 
     def __init__(self,
-                 sim_model: sim,
+                 beamformer: Beamformer,
                  objective_fn: Callable,
+                 projection_fn: Optional[Callable] = None,
                  learning_rate: float = 0.1,
                  max_iterations: int = 1000,
                  tolerance: float = 1e-6,
-                 projection: str = 'modulo',
                  verbose: bool = True):
         """
         Initialize Projected Gradient Ascent optimizer.
 
         Args:
-            sim_model: SIM object to optimize
-            objective_fn: Function to maximize, signature: objective_fn(phases) -> scalar
-                         Should return a scalar tensor (loss/reward to maximize)
+            beamformer: Beamformer object (contains SIM, channels, and all components)
+            objective_fn: Function to maximize, signature: objective_fn(params) -> scalar
+                         Should return a scalar tensor to maximize
+                         Examples:
+                           - Phases: lambda phases: beamformer.compute_sum_rate(phases, power)
+                           - Weights: lambda W: beamformer.compute_sum_rate(None, power, W)
+            projection_fn: Function to project parameters onto constraint set
+                          Signature: projection_fn(params) -> projected_params
+                          If None, defaults to phase projection [0, 2Ï€]
+                          Use static methods like:
+                            - PGA.project_phases (default)
+                            - PGA.project_weights_normalize
+                            - PGA.project_power
+                            - Your custom projection
             learning_rate: Step size for gradient ascent
             max_iterations: Maximum number of iterations
             tolerance: Convergence threshold (stop if |objective_change| < tolerance)
-            projection: Projection method ('modulo' or 'clip')
-                       'modulo': phases mod 2À (wraps around)
-                       'clip': clip to [0, 2À] (hard boundaries)
             verbose: Print optimization progress
         """
-        self.sim_model = sim_model
+        self.beamformer = beamformer
+        self.sim_model = beamformer.sim_model
         self.objective_fn = objective_fn
         self.learning_rate = learning_rate
         self.max_iterations = max_iterations
         self.tolerance = tolerance
-        self.projection = projection
         self.verbose = verbose
 
-        # Get device from SIM
-        self.device = sim_model.device
+        # Default projection: phases [0, 2Ï€]
+        if projection_fn is None:
+            self.projection_fn = self.project_phases
+        else:
+            self.projection_fn = projection_fn
+
+        # Get device from beamformer
+        self.device = beamformer.device
 
         # Optimization history
         self.history = {
             'objective': [],
             'gradient_norm': [],
-            'phase_change': []
+            'param_change': []
         }
 
-    def _project_phases(self, phases: torch.Tensor) -> torch.Tensor:
+    # ========== Projection Functions (Static Methods) ==========
+
+    @staticmethod
+    def project_phases(phases: torch.Tensor) -> torch.Tensor:
         """
-        Project phases onto [0, 2À] constraint set.
+        Project phases onto [0, 2Ï€] constraint set using modulo.
 
         Args:
             phases: (L, N) tensor of phase values
 
         Returns:
-            Projected phases in [0, 2À]
+            Projected phases in [0, 2Ï€]
         """
-        if self.projection == 'modulo':
-            # Wrap phases to [0, 2À] using modulo
-            return torch.fmod(phases, 2 * np.pi) % (2 * np.pi)
-        elif self.projection == 'clip':
-            # Clip phases to [0, 2À]
-            return torch.clamp(phases, 0, 2 * np.pi)
-        else:
-            raise ValueError(f"Unknown projection method: {self.projection}")
+        return torch.fmod(phases, 2 * np.pi) % (2 * np.pi)
 
-    def optimize(self, initial_phases: Optional[torch.Tensor] = None) -> Dict:
+    @staticmethod
+    def project_phases_clip(phases: torch.Tensor) -> torch.Tensor:
+        """
+        Project phases onto [0, 2Ï€] by clipping.
+
+        Args:
+            phases: (L, N) tensor of phase values
+
+        Returns:
+            Clipped phases in [0, 2Ï€]
+        """
+        return torch.clamp(phases, 0, 2 * np.pi)
+
+    @staticmethod
+    def project_weights_normalize(weights: torch.Tensor) -> torch.Tensor:
+        """
+        Project digital beamforming weights by normalizing each column.
+
+        Args:
+            weights: (M, K) complex tensor - beamforming weights
+
+        Returns:
+            Normalized weights where ||w_k|| = 1 for each user k
+        """
+        weights_normalized = weights.clone()
+        K = weights.shape[1]
+        for k in range(K):
+            norm = torch.norm(weights_normalized[:, k])
+            if norm > 1e-10:  # Avoid division by zero
+                weights_normalized[:, k] = weights_normalized[:, k] / norm
+        return weights_normalized
+
+    @staticmethod
+    def project_power(power: torch.Tensor, total_power: float = 1.0) -> torch.Tensor:
+        """
+        Project power allocation onto feasible set: sum(power) = total_power, power >= 0.
+
+        Args:
+            power: (K,) tensor of power values
+            total_power: Total power constraint
+
+        Returns:
+            Projected power allocation
+        """
+        # Clip negative values to zero
+        power_positive = torch.clamp(power, min=0.0)
+
+        # Normalize to sum to total_power
+        power_sum = power_positive.sum()
+        if power_sum > 1e-10:
+            power_normalized = power_positive * (total_power / power_sum)
+        else:
+            # If all zeros, use uniform allocation
+            power_normalized = torch.ones_like(power) * (total_power / len(power))
+
+        return power_normalized
+
+
+    # ========== Main Optimization ==========
+
+    def optimize(self, initial_params: torch.Tensor) -> Dict:
         """
         Run Projected Gradient Ascent optimization.
 
         Args:
-            initial_phases: (L, N) initial phase values. If None, uses current SIM phases.
+            initial_params: Initial parameter values (any shape).
+                           Examples:
+                             - Phases: torch.rand(L, N) * 2 * np.pi
+                             - Weights: torch.randn(M, K, dtype=torch.complex64)
+                             - Power: torch.ones(K) * (total_power / K)
 
         Returns:
             Dictionary with:
-                - 'optimal_phases': (L, N) optimized phases
-                - 'optimal_objective': final objective value
-                - 'iterations': number of iterations performed
-                - 'converged': whether algorithm converged
-                - 'history': optimization history
+                - 'optimal_params': Optimized parameters
+                - 'optimal_objective': Final objective value
+                - 'iterations': Number of iterations performed
+                - 'converged': Whether algorithm converged
+                - 'history': Optimization history
         """
-        # Initialize phases
-        if initial_phases is None:
-            phases = self.sim_model.values().clone().detach()
-        else:
-            phases = initial_phases.clone().detach()
+        # Initialize parameters (clone to avoid modifying input)
+        params = initial_params.clone().detach()
 
-        phases = phases.to(self.device)
-        phases.requires_grad = True
+        params = params.to(self.device)
+        params.requires_grad = True
 
         # Reset history
         self.history = {
             'objective': [],
             'gradient_norm': [],
-            'phase_change': []
+            'param_change': []
         }
 
         if self.verbose:
             print("=" * 70)
             print("Projected Gradient Ascent Optimization")
             print("=" * 70)
+            print(f"Parameter shape: {params.shape}")
             print(f"Learning rate: {self.learning_rate}")
             print(f"Max iterations: {self.max_iterations}")
             print(f"Tolerance: {self.tolerance}")
-            print(f"Projection: {self.projection}")
+            print(f"Projection: {self.projection_fn.__name__}")
             print()
 
         converged = False
@@ -124,41 +203,41 @@ class ProjectedGradientAscent:
 
         for iteration in range(self.max_iterations):
             # Zero gradients
-            if phases.grad is not None:
-                phases.grad.zero_()
-
-            # Update SIM with current phases
-            self.sim_model.update_phases(phases.detach())
+            if params.grad is not None:
+                params.grad.zero_()
 
             # Compute objective (forward pass)
-            objective = self.objective_fn(phases)
+            # The objective_fn receives params and computes the objective
+            objective = self.objective_fn(params)
 
             # Compute gradient (backward pass)
             objective.backward()
 
             # Store gradient norm
-            grad_norm = torch.norm(phases.grad).item()
+            grad_norm = torch.norm(params.grad).item()
 
             # Gradient ascent step
             with torch.no_grad():
-                phases_old = phases.clone()
-                phases.data = phases.data + self.learning_rate * phases.grad
+                params_old = params.clone()
+
+                # Update parameters
+                params.data = params.data + self.learning_rate * params.grad
 
                 # Project onto constraint set
-                phases.data = self._project_phases(phases.data)
+                params.data = self.projection_fn(params.data)
 
-                # Compute phase change
-                phase_change = torch.norm(phases - phases_old).item()
+                # Compute parameter change
+                param_change = torch.norm(params - params_old).item()
 
             # Detach and reattach for next iteration
-            phases = phases.detach()
-            phases.requires_grad = True
+            params = params.detach()
+            params.requires_grad = True
 
             # Store history
             objective_value = objective.item()
             self.history['objective'].append(objective_value)
             self.history['gradient_norm'].append(grad_norm)
-            self.history['phase_change'].append(phase_change)
+            self.history['param_change'].append(param_change)
 
             # Check convergence
             if prev_objective is not None:
@@ -175,12 +254,11 @@ class ProjectedGradientAscent:
             # Print progress
             if self.verbose and (iteration % 10 == 0 or iteration == self.max_iterations - 1):
                 print(f"Iter {iteration:4d} | Obj: {objective_value:12.6f} | "
-                      f"Grad norm: {grad_norm:10.6f} | Phase change: {phase_change:10.6f}")
+                      f"Grad norm: {grad_norm:10.6f} | Param change: {param_change:10.6f}")
 
-        # Final update
-        optimal_phases = phases.detach()
-        self.sim_model.update_phases(optimal_phases)
-        final_objective = self.objective_fn(optimal_phases).item()
+        # Final update and evaluation
+        optimal_params = params.detach()
+        final_objective = self.objective_fn(optimal_params).item()
 
         if self.verbose:
             print()
@@ -193,7 +271,7 @@ class ProjectedGradientAscent:
             print()
 
         return {
-            'optimal_phases': optimal_phases,
+            'optimal_params': optimal_params,
             'optimal_objective': final_objective,
             'iterations': iteration + 1,
             'converged': converged,
@@ -231,12 +309,12 @@ class ProjectedGradientAscent:
         ax.set_title('Gradient Magnitude')
         ax.grid(True, alpha=0.3)
 
-        # Plot phase change
+        # Plot parameter change
         ax = axes[2]
-        ax.semilogy(self.history['phase_change'], 'g-', linewidth=2)
+        ax.semilogy(self.history['param_change'], 'g-', linewidth=2)
         ax.set_xlabel('Iteration')
-        ax.set_ylabel('Phase Change (log scale)')
-        ax.set_title('Phase Update Magnitude')
+        ax.set_ylabel('Parameter Change (log scale)')
+        ax.set_title('Parameter Update Magnitude')
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -246,50 +324,3 @@ class ProjectedGradientAscent:
             print(f"Convergence plot saved to {save_path}")
         else:
             plt.show()
-
-
-class AdaptiveProjectedGradientAscent(ProjectedGradientAscent):
-    """
-    PGA with adaptive learning rate (line search or momentum).
-
-    Inherits from ProjectedGradientAscent and adds:
-    - Backtracking line search for adaptive step size
-    - Momentum for faster convergence
-    """
-
-    def __init__(self,
-                 sim_model: sim,
-                 objective_fn: Callable,
-                 initial_learning_rate: float = 0.1,
-                 momentum: float = 0.9,
-                 backtracking: bool = True,
-                 backtrack_factor: float = 0.5,
-                 max_iterations: int = 1000,
-                 tolerance: float = 1e-6,
-                 projection: str = 'modulo',
-                 verbose: bool = True):
-        """
-        Initialize Adaptive PGA optimizer.
-
-        Args:
-            sim_model: SIM object to optimize
-            objective_fn: Function to maximize
-            initial_learning_rate: Initial step size
-            momentum: Momentum coefficient [0, 1] (0 = no momentum)
-            backtracking: Use backtracking line search for step size
-            backtrack_factor: Factor to reduce step size in backtracking
-            max_iterations: Maximum number of iterations
-            tolerance: Convergence threshold
-            projection: Projection method
-            verbose: Print progress
-        """
-        super().__init__(sim_model, objective_fn, initial_learning_rate,
-                        max_iterations, tolerance, projection, verbose)
-
-        self.momentum = momentum
-        self.backtracking = backtracking
-        self.backtrack_factor = backtrack_factor
-        self.velocity = None  # For momentum
-
-    # TODO: Implement adaptive optimization in future version
-    # For now, inherits base PGA behavior

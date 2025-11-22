@@ -79,3 +79,45 @@ def rayleighSommerfeld(source_positions: Union[torch.Tensor, np.ndarray],
         W = torch.tensor(W, dtype=torch.complex64, device=device)
 
         return W
+
+def complex_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Manual complex matrix multiplication using real operations only.
+
+    This is a workaround for MPS (Apple Silicon GPU) which has incomplete
+    complex number support. Decomposes complex @ into real operations.
+
+    Math:
+        C = A @ B where A, B are complex
+        C_real = A_real @ B_real - A_imag @ B_imag
+        C_imag = A_real @ B_imag + A_imag @ B_real
+
+    Args:
+        A: Complex tensor (..., M, K)
+        B: Complex tensor (..., K, N)
+
+    Returns:
+        C: Complex tensor (..., M, N) = A @ B
+
+    Example:
+        >>> A = torch.randn(3, 4, dtype=torch.complex64, device='mps')
+        >>> B = torch.randn(4, 5, dtype=torch.complex64, device='mps')
+        >>> C = complex_matmul(A, B)  # Works on MPS!
+        >>> # Equivalent to: C = A @ B (but this might fail on MPS)
+    """
+    # Extract real and imaginary parts
+    A_real = A.real
+    A_imag = A.imag
+    B_real = B.real
+    B_imag = B.imag
+
+    # Compute real and imaginary parts of result
+    # C_real = A_real @ B_real - A_imag @ B_imag
+    # C_imag = A_real @ B_imag + A_imag @ B_real
+    C_real = A_real @ B_real - A_imag @ B_imag
+    C_imag = A_real @ B_imag + A_imag @ B_real
+
+    # Combine back into complex tensor
+    C = torch.complex(C_real, C_imag)
+
+    return C

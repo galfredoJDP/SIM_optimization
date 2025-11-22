@@ -180,7 +180,8 @@ def visualize_antenna_array(antenna_positions, array_config, save_path=None):
 # System parameters
 num_users = 4
 wavelength = 0.125  # meters
-device = 'cpu'
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+print(f"Using device: {device}")
 
 # Antenna array (for digital beamformer)
 Nx_antenna = 2

@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from typing import Optional
+from simpy.util.util import complex_matmul
 
 class Transceiver:
     """
@@ -196,7 +197,8 @@ class Transceiver:
             sinr: (K,) tensor - SINR for each user
         """
         if beamforming_weights is not None: #assume only SIM
-            effective_channel = channel@beamforming_weights
+            # Use complex_matmul for MPS compatibility
+            effective_channel = complex_matmul(channel, beamforming_weights)
         else:
             effective_channel = channel
 
@@ -262,11 +264,13 @@ class Transceiver:
 
         # W = H^H (H H^H)^{-1}
         H = channel  # (K, A)
-        HHH = H @ H.conj().T  # (K, K)
+        # Use complex_matmul for MPS compatibility
+        HHH = complex_matmul(H, H.conj().T)  # (K, K)
 
         # Add small regularization for numerical stability
         HHH_inv = torch.linalg.inv(HHH + 1e-8 * torch.eye(K, dtype=H.dtype, device=self.device))
 
-        weights = H.conj().T @ HHH_inv  # (A, K)
+        # Use complex_matmul for MPS compatibility
+        weights = complex_matmul(H.conj().T, HHH_inv)  # (A, K)
 
         return weights

@@ -180,7 +180,7 @@ def visualize_antenna_array(antenna_positions, array_config, save_path=None):
 # System parameters
 num_users = 4
 wavelength = 0.125  # meters
-device = 'cpu'
+device = 'mps'
 
 # Antenna array (for digital beamformer)
 Nx_antenna = 2
@@ -227,8 +227,8 @@ sim_model = Sim(
     wavelength=wavelength,
     device=device
 )
-print(f"   SIM created: {sim_layers}L x {sim_metaatoms}N")
-print(f"   Psi matrix shape: {sim_model.Psi.shape}")
+# print(f"   SIM created: {sim_layers}L x {sim_metaatoms}N")
+# print(f"   Psi matrix shape: {sim_model.Psi.shape}")
 
 print("\n2. Creating SIM Beamformer (M=K=4 architecture)...")
 sim_beamformer = Beamformer(
@@ -251,33 +251,31 @@ sim_beamformer = Beamformer(
     total_power=total_power,
 )
 
-print("\n3. Visualizing SIM structure and antenna positions...")
-visualize_sim_with_antennas(sim_model, sim_beamformer.get_positions(),
-                           save_path='sim_with_antennas.png')
+# print("\n3. Visualizing SIM structure and antenna positions...")
+# visualize_sim_with_antennas(sim_model, sim_beamformer.get_positions(),
+#                            save_path='sim_with_antennas.png')
 
-print("\n4. Channel matrices (auto-generated during init):")
-print(f"   A matrix (antennas → SIM layer 0): {sim_beamformer.A.shape}")
-print(f"      Interpretation: {sim_beamformer.A.shape[1]} antennas → {sim_beamformer.A.shape[0]} meta-atoms")
-print(f"   Psi matrix (SIM propagation):       {sim_model.Psi.shape}")
-print(f"      Interpretation: Layer 0 → Layer {sim_layers-1} through {sim_layers} layers")
-print(f"   H matrix (SIM → users):             {sim_beamformer.H.shape}")
-print(f"      Interpretation: {sim_beamformer.H.shape[1]} meta-atoms → {sim_beamformer.H.shape[0]} users")
+# print("\n4. Channel matrices (auto-generated during init):")
+# print(f"   A matrix (antennas → SIM layer 0): {sim_beamformer.A.shape}")
+# print(f"      Interpretation: {sim_beamformer.A.shape[1]} antennas → {sim_beamformer.A.shape[0]} meta-atoms")
+# print(f"   Psi matrix (SIM propagation):       {sim_model.Psi.shape}")
+# print(f"      Interpretation: Layer 0 → Layer {sim_layers-1} through {sim_layers} layers")
+# print(f"   H matrix (SIM → users):             {sim_beamformer.H.shape}")
+# print(f"      Interpretation: {sim_beamformer.H.shape[1]} meta-atoms → {sim_beamformer.H.shape[0]} users")
 """
-SIM-based beamforming optimization here --------------------------------------------------
+SIM-based beamforming optimization here ----------------------------------------------------------------------
 """
-print("\n" + "-"*80)
-print("5. >>> OPTIMIZATION GOES HERE <<<")
-print("-"*80)
+
+
 # Dummy SIM phases - this is where optimization would go!
-sim_phases_dummy = torch.rand(sim_layers, sim_metaatoms, device=device) * 2 * np.pi
-print(f"   Phase matrix shape: {sim_phases_dummy.shape} = (L={sim_layers}, N={sim_metaatoms})")
+sim_phases_dummy = torch.rand(sim_layers, sim_metaatoms, device=device,  ) * 2 * np.pi
+
 
 #Uniform power allocation , this is where real power allocation strategy would go!
 power_allocation = torch.ones(num_users, device=device) * (total_power / num_users)
-print(f"   Power allocation:   {power_allocation.shape} = (K={num_users},)")
-print("-"*80)
+
 """
----------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------
 """
 print("\n6. Computing SINR and Sum-Rate...")
 sum_rate_sim = sim_beamformer.compute_sum_rate(phases=sim_phases_dummy, power_allocation=power_allocation)
@@ -291,80 +289,80 @@ print(f"      = Same as above (no digital weights in SIM-only case)")
 print(f"   Interpretation: (K={sim_beamformer.last_effective_channel.shape[0]}, M={sim_beamformer.last_effective_channel.shape[1]})")
 print(f"   Since M=K: H_eff[k,k] = signal, H_eff[k,j≠k] = interference")
 
-# ========== Case 2: Digital Beamformer (No SIM) ==========
-print("\n" + "="*80)
-print("CASE 2: DIGITAL BEAMFORMING (Traditional M > K Architecture)")
-print("="*80)
+# # ========== Case 2: Digital Beamformer (No SIM) ==========
+# print("\n" + "="*80)
+# print("CASE 2: DIGITAL BEAMFORMING (Traditional M > K Architecture)")
+# print("="*80)
 
-print("\n1. Creating Digital Beamformer ...")
-digital_beamformer = Beamformer(
-    # Transceiver params - Using M=64 antennas for K=4 users
-    Nx=Nx_antenna,  # 8x8 = 64 antennas
-    Ny=Ny_antenna,
-    wavelength=wavelength,
-    device=device,
-    # Channel params (CLT mode - no user_positions)
-    num_users=num_users,
-    user_positions=None,  # Will use CLT mode
-    reference_distance=reference_distance,
-    path_loss_at_reference=path_loss_at_reference,
-    min_user_distance=min_user_distance,
-    max_user_distance=max_user_distance,
-    # System params
-    noise_power=noise_power,
-    total_power=total_power,
-    use_nearfield_user_channel=False  # Use CLT mode
-)
-print(f"   Created with M={num_antennas} antennas, K={num_users} users")
+# print("\n1. Creating Digital Beamformer ...")
+# digital_beamformer = Beamformer(
+#     # Transceiver params - Using M=64 antennas for K=4 users
+#     Nx=Nx_antenna,  # 8x8 = 64 antennas
+#     Ny=Ny_antenna,
+#     wavelength=wavelength,
+#     device=device,
+#     # Channel params (CLT mode - no user_positions)
+#     num_users=num_users,
+#     user_positions=None,  # Will use CLT mode
+#     reference_distance=reference_distance,
+#     path_loss_at_reference=path_loss_at_reference,
+#     min_user_distance=min_user_distance,
+#     max_user_distance=max_user_distance,
+#     # System params
+#     noise_power=noise_power,
+#     total_power=total_power,
+#     use_nearfield_user_channel=False  # Use CLT mode
+# )
+# print(f"   Created with M={num_antennas} antennas, K={num_users} users")
 
-print("\n2. Visualizing antenna array positions...")
-visualize_antenna_array(digital_beamformer.get_positions(),
-                       array_config=(Nx_antenna, Ny_antenna),
-                       save_path='antenna_array.png')
+# print("\n2. Visualizing antenna array positions...")
+# visualize_antenna_array(digital_beamformer.get_positions(),
+#                        array_config=(Nx_antenna, Ny_antenna),
+#                        save_path='antenna_array.png')
 
 
-"""
-Digital Only Beamformer Optimization ----------------------------------------------------------------
-"""
-print("\n" + "-"*80)
-print("3. >>> OPTIMIZATION GOES HERE <<<")
-print("-"*80)
-# Digital beamforming weights
-W_digital_dummy = torch.randn(num_antennas, num_users, dtype=torch.complex64, device=device)
-# Normalize columns to unit norm (common practice)
-for k in range(num_users):
-    W_digital_dummy[:, k] /= torch.norm(W_digital_dummy[:, k])
-print(f"   Digital beamforming weights W: {W_digital_dummy.shape}")
-print(f"   Interpretation: (M={num_antennas}, K={num_users})")
-print(f"   Column k = beamforming vector for user k")
+# """
+# Digital Only Beamformer Optimization ----------------------------------------------------------------
+# """
+# print("\n" + "-"*80)
+# print("3. >>> OPTIMIZATION GOES HERE <<<")
+# print("-"*80)
+# # Digital beamforming weights
+# W_digital_dummy = torch.randn(num_antennas, num_users, dtype=torch.complex64, device=device)
+# # Normalize columns to unit norm (common practice)
+# for k in range(num_users):
+#     W_digital_dummy[:, k] /= torch.norm(W_digital_dummy[:, k])
+# print(f"   Digital beamforming weights W: {W_digital_dummy.shape}")
+# print(f"   Interpretation: (M={num_antennas}, K={num_users})")
+# print(f"   Column k = beamforming vector for user k")
 
-power_allocation = torch.ones(num_users, device=device) * (total_power / num_users)
-print(f"   Power allocation:              {power_allocation.shape} = (K={num_users},)")
-print("-"*80)
-"""
--------------------------------------------------------------------------------------
-"""
-print("\n4. Computing SINR and Sum-Rate...")
-sum_rate_digital = digital_beamformer.compute_sum_rate(
-    phases=None,  # No SIM
-    power_allocation=power_allocation,
-    digital_beamforming_weights=W_digital_dummy
-)
-print(f"   Sum-Rate:  {sum_rate_digital.item():.4f} bits/s/Hz")
+# power_allocation = torch.ones(num_users, device=device) * (total_power / num_users)
+# print(f"   Power allocation:              {power_allocation.shape} = (K={num_users},)")
+# print("-"*80)
+# """
+# ------------------------------------------------------------------------------------------------------
+# """
+# print("\n4. Computing SINR and Sum-Rate...")
+# sum_rate_digital = digital_beamformer.compute_sum_rate(
+#     phases=None,  # No SIM
+#     power_allocation=power_allocation,
+#     digital_beamforming_weights=W_digital_dummy
+# )
+# print(f"   Sum-Rate:  {sum_rate_digital.item():.4f} bits/s/Hz")
 
-print("\n5. Verifying channels used in SINR computation...")
-print(f"   Pre-digital-weights channel shape: {digital_beamformer.pre_digital_weights_channel.shape}")
-print(f"      = H (antennas → users)")
-print(f"   Effective channel shape: {digital_beamformer.last_effective_channel.shape}")
-print(f"      = H @ W (after digital beamforming weights)")
-print(f"   Interpretation: (K={digital_beamformer.last_effective_channel.shape[0]}, K={digital_beamformer.last_effective_channel.shape[1]})")
-print(f"   H_eff[k,k] = signal for user k, H_eff[k,j≠k] = interference from beam j")
+# print("\n5. Verifying channels used in SINR computation...")
+# print(f"   Pre-digital-weights channel shape: {digital_beamformer.pre_digital_weights_channel.shape}")
+# print(f"      = H (antennas → users)")
+# print(f"   Effective channel shape: {digital_beamformer.last_effective_channel.shape}")
+# print(f"      = H @ W (after digital beamforming weights)")
+# print(f"   Interpretation: (K={digital_beamformer.last_effective_channel.shape[0]}, K={digital_beamformer.last_effective_channel.shape[1]})")
+# print(f"   H_eff[k,k] = signal for user k, H_eff[k,j≠k] = interference from beam j")
 
-# ========== Summary ==========
-print("\n" + "="*80)
-print("SUMMARY")
-print("="*80)
-print(f"\nSIM-based (M=K=4):    Sum-Rate = {sum_rate_sim.item():.4f} bits/s/Hz")
-print(f"Digital (M=64, K=4):  Sum-Rate = {sum_rate_digital.item():.4f} bits/s/Hz")
-print(f"\nNote: Random weights used - digital should perform better with optimized weights")
-print("="*80)
+# # ========== Summary ==========
+# print("\n" + "="*80)
+# print("SUMMARY")
+# print("="*80)
+# print(f"\nSIM-based (M=K=4):    Sum-Rate = {sum_rate_sim.item():.4f} bits/s/Hz")
+# print(f"Digital (M=64, K=4):  Sum-Rate = {sum_rate_digital.item():.4f} bits/s/Hz")
+# print(f"\nNote: Random weights used - digital should perform better with optimized weights")
+# print("="*80)

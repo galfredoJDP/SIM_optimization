@@ -109,6 +109,13 @@ class ProjectedGradientAscent:
         return torch.clamp(phases, 0, 2 * np.pi)
 
     @staticmethod
+    def project_phases_lore(phases: torch.Tensor) -> torch.Tensor:
+        """
+        A placeholder for finding the optimal phases using the lorenztian constraint method.
+        """
+        pass
+    
+    @staticmethod
     def project_weights_normalize(weights: torch.Tensor) -> torch.Tensor:
         """
         Project digital beamforming weights by normalizing each column.

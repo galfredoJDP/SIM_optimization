@@ -154,11 +154,12 @@ class Beamformer(Transceiver, UserChannel):
                      power_allocation: Optional[torch.Tensor] = None,
                      digital_beamforming_weights : Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Compute SINR for each user with given SIM phases.
+        Actually computes the channel first then computes the SINR. Could handle SIM-only, digital-only, or hybrid.
 
         Args:
-            phases: (L, N) SIM phase configuration
+            phases: (L, N) SIM phase configuration. If None, assumes digital beamforming only .
             power_allocation: (K,) power allocation. If None, uses equal power.
+            digital_beamforming_weights: (M, K) digital beamforming weights. If None, assumes SIM-only.
 
         Returns:
             sinr: (K,) SINR for each user
@@ -174,8 +175,14 @@ class Beamformer(Transceiver, UserChannel):
             power_allocation = torch.ones(self.num_users, device=self.device)
             power_allocation *= (self.total_power / self.num_users)
 
+        if digital_beamforming_weights is not None: #assume only SIM
+            # Use complex_matmul for MPS compatibility
+            effective_channel = complex_matmul(H_eff, digital_beamforming_weights)
+        else:
+            effective_channel = H_eff
+
         # Compute SINR (this will save last_effective_channel in compute_sinr_downlink)
-        sinr = self.compute_sinr_downlink(H_eff, power_allocation, self.noise_power, digital_beamforming_weights)  # From Transceiver
+        sinr = self.compute_sinr_downlink(effective_channel, power_allocation, self.noise_power)  # From Transceiver
         return sinr
 
     def compute_sum_rate(self, phases: torch.Tensor,

@@ -196,14 +196,10 @@ class Transceiver:
         Returns:
             sinr: (K,) tensor - SINR for each user
         """
-        if beamforming_weights is not None: #assume only SIM
-            # Use complex_matmul for MPS compatibility
-            effective_channel = complex_matmul(channel, beamforming_weights)
-        else:
-            effective_channel = channel
+        
 
         # Save the effective channel used for this computation
-        self.last_effective_channel = effective_channel
+        self.last_effective_channel = channel
 
         K = channel.shape[0]  # Number of users
 
@@ -212,13 +208,13 @@ class Transceiver:
 
         for k in range(K):
             # Signal power: P_k * |h_k^H w_k|^2
-            signal_power = power_allocation[k] * torch.abs(effective_channel[k, k])**2
+            signal_power = power_allocation[k] * torch.abs(channel[k, k])**2
 
             # Interference power: sum_{j≠k} P_j * |h_k^H w_j|^2
             interference_power = 0.0
             for j in range(K):
                 if j != k:
-                    interference_power += power_allocation[j] * torch.abs(effective_channel[k, j])**2
+                    interference_power += power_allocation[j] * torch.abs(channel[k, j])**2
 
             # SINR
             sinr[k] = signal_power / (interference_power + noise_power)

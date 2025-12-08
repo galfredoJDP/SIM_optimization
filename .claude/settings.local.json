@@ -3,7 +3,8 @@
     "allow": [
       "Bash(bash -c:*)",
       "Bash(bash -l -c \"conda activate torchm && python test/test_beamformer_flow.py\")",
-      "Bash(/opt/homebrew/anaconda3/envs/torchm/bin/python:*)"
+      "Bash(/opt/homebrew/anaconda3/envs/torchm/bin/python:*)",
+      "Bash(python test_ddpg.py:*)"
     ],
     "deny": [],
     "ask": []

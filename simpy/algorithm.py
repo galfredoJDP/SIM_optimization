@@ -1,6 +1,10 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-from typing import Callable, Optional, Dict, List
+from typing import Callable, Optional, Dict, List, Tuple, Union
+from collections import deque
+import random
 from simpy.sim import Sim
 from simpy.beamformer import Beamformer
 
@@ -32,7 +36,11 @@ class ProjectedGradientAscent:
                  learning_rate: float = 0.1,
                  max_iterations: int = 1000,
                  tolerance: float = 1e-6,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 use_backtracking: bool = False,
+                 backtrack_beta: float = 0.5,
+                 backtrack_c: float = 0.5,
+                 backtrack_max_iter: int = 100):
         """
         Initialize Projected Gradient Ascent optimizer.
 
@@ -51,10 +59,14 @@ class ProjectedGradientAscent:
                             - PGA.project_weights_normalize
                             - PGA.project_power
                             - Your custom projection
-            learning_rate: Step size for gradient ascent
+            learning_rate: Step size for gradient ascent (used if use_backtracking=False)
             max_iterations: Maximum number of iterations
             tolerance: Convergence threshold (stop if |objective_change| < tolerance)
             verbose: Print optimization progress
+            use_backtracking: If True, use backtracking line search for adaptive step size
+            backtrack_beta: Backtracking shrinkage factor (typically 0.5)
+            backtrack_c: Armijo condition parameter (typically 0.5)
+            backtrack_max_iter: Maximum backtracking iterations (default 100)
         """
         self.beamformer = beamformer
         self.sim_model = beamformer.sim_model
@@ -63,6 +75,12 @@ class ProjectedGradientAscent:
         self.max_iterations = max_iterations
         self.tolerance = tolerance
         self.verbose = verbose
+
+        # Backtracking line search parameters
+        self.use_backtracking = use_backtracking
+        self.backtrack_beta = backtrack_beta
+        self.backtrack_c = backtrack_c
+        self.backtrack_max_iter = backtrack_max_iter
 
         # Default projection: phases [0, 2π]
         if projection_fn is None:
@@ -77,7 +95,8 @@ class ProjectedGradientAscent:
         self.history = {
             'objective': [],
             'gradient_norm': [],
-            'param_change': []
+            'param_change': [],
+            'step_size': []
         }
 
     # ========== Projection Functions (Static Methods) ==========
@@ -93,7 +112,7 @@ class ProjectedGradientAscent:
         Returns:
             Projected phases in [0, 2π]
         """
-        return torch.fmod(phases, 2 * np.pi) % (2 * np.pi)
+        return torch.remainder(phases, 2 * np.pi)
 
     @staticmethod
     def project_phases_clip(phases: torch.Tensor) -> torch.Tensor:
@@ -160,6 +179,46 @@ class ProjectedGradientAscent:
         return power_normalized
 
 
+    # ========== Backtracking Line Search ==========
+
+    def _backtracking_line_search(self, params: torch.Tensor, gradient: torch.Tensor,
+                                   current_objective: float) -> float:
+        """
+        Perform backtracking line search to find adaptive step size.
+
+        Implements Armijo condition: f(x + μ∇f) >= f(x) + c·μ·||∇f||²
+
+        Args:
+            params: Current parameters
+            gradient: Gradient at current parameters
+            current_objective: Current objective value f(params)
+
+        Returns:
+            Step size μ that satisfies Armijo condition
+        """
+        mu = 1.0
+        grad_norm_sq = (torch.norm(gradient)**2).item()
+
+        for _ in range(self.backtrack_max_iter):
+            # Test new parameters with current step size
+            with torch.no_grad():
+                params_test = params + mu * gradient
+                # Project onto constraint set
+                params_test = self.projection_fn(params_test)
+
+            # Evaluate objective at test point
+            new_objective = self.objective_fn(params_test).item()
+
+            # Check Armijo condition
+            if new_objective >= current_objective + self.backtrack_c * mu * grad_norm_sq:
+                # Accept this step size
+                break
+
+            # Shrink step size
+            mu = self.backtrack_beta * mu
+
+        return mu
+
     # ========== Main Optimization ==========
 
     def optimize(self, initial_params: torch.Tensor) -> Dict:
@@ -191,7 +250,8 @@ class ProjectedGradientAscent:
         self.history = {
             'objective': [],
             'gradient_norm': [],
-            'param_change': []
+            'param_change': [],
+            'step_size': []
         }
 
         if self.verbose:
@@ -199,7 +259,11 @@ class ProjectedGradientAscent:
             print("Projected Gradient Ascent Optimization")
             print("=" * 70)
             print(f"Parameter shape: {params.shape}")
-            print(f"Learning rate: {self.learning_rate}")
+            if self.use_backtracking:
+                print(f"Step size: Adaptive (backtracking line search)")
+                print(f"  Beta: {self.backtrack_beta}, c: {self.backtrack_c}")
+            else:
+                print(f"Learning rate: {self.learning_rate}")
             print(f"Max iterations: {self.max_iterations}")
             print(f"Tolerance: {self.tolerance}")
             print(f"Projection: {self.projection_fn.__name__}")
@@ -220,15 +284,23 @@ class ProjectedGradientAscent:
             # Compute gradient (backward pass)
             objective.backward()
 
-            # Store gradient norm
-            grad_norm = torch.norm(params.grad).item()
+            # Store gradient and objective value
+            gradient = params.grad.detach().clone()
+            grad_norm = torch.norm(gradient).item()
+            objective_value = objective.item()
+
+            # Determine step size
+            if self.use_backtracking:
+                step_size = self._backtracking_line_search(params, gradient, objective_value)
+            else:
+                step_size = self.learning_rate
 
             # Gradient ascent step
             with torch.no_grad():
                 params_old = params.clone()
 
-                # Update parameters
-                params.data = params.data + self.learning_rate * params.grad
+                # Update parameters with adaptive or fixed step size
+                params.data = params.data + step_size * gradient
 
                 # Project onto constraint set
                 params.data = self.projection_fn(params.data)
@@ -241,10 +313,10 @@ class ProjectedGradientAscent:
             params.requires_grad = True
 
             # Store history
-            objective_value = objective.item()
             self.history['objective'].append(objective_value)
             self.history['gradient_norm'].append(grad_norm)
             self.history['param_change'].append(param_change)
+            self.history['step_size'].append(step_size)
 
             # Check convergence
             if prev_objective is not None:
@@ -331,3 +403,840 @@ class ProjectedGradientAscent:
             print(f"Convergence plot saved to {save_path}")
         else:
             plt.show()
+
+
+class WaterFilling:
+    """
+    Iterative Water-Filling for Multi-User Power Allocation.
+
+    Pure power allocation algorithm that only needs effective channel and noise.
+    Works with any beamforming scheme (SIM, digital, hybrid).
+
+    Algorithm:
+        1. Given fixed effective channel H_eff (K, K)
+        2. Iteratively optimize power for each user treating interference as noise
+        3. Apply water-filling: allocate more power to users with better channels
+        4. Repeat until convergence
+
+    Reference: "Water-Filling: A Simple Concept" - various papers on multi-user systems
+
+    Attributes (accessible via self):
+        H_eff (torch.Tensor): Effective channel matrix (K, K)
+                              H_eff[k,k] = signal gain for user k
+                              H_eff[k,j] = interference from beam j to user k
+        noise_power (float): Noise power in Watts
+        total_power (float): Total power budget P_T in Watts
+        max_iterations (int): Maximum iterations for convergence
+        tolerance (float): Convergence threshold for power change
+        verbose (bool): Whether to print optimization progress
+        device (str): Computation device ('cpu', 'cuda', 'mps')
+        K (int): Number of users
+        channel_gains (torch.Tensor): Diagonal channel gains |H_eff[k,k]|^2 (K,)
+        history (dict): Optimization history with keys:
+                        - 'sum_rate': List of sum-rate values per iteration
+                        - 'power_change': List of power changes per iteration
+    """
+
+    def __init__(self,
+                 H_eff: torch.Tensor,
+                 noise_power: float,
+                 total_power: float = 1.0,
+                 max_iterations: int = 100,
+                 tolerance: float = 1e-6,
+                 verbose: bool = True,
+                 device: str = 'cpu'):
+        """
+        Initialize Water-Filling optimizer.
+
+        Args:
+            H_eff: Effective channel matrix (K, K) after beamforming
+                   H_eff[k,k] = signal gain for user k
+                   H_eff[k,j] = interference from beam j to user k
+            noise_power: Noise power in Watts
+            total_power: Total power budget P_T in Watts
+            max_iterations: Maximum iterations for convergence
+            tolerance: Convergence threshold for power change
+            verbose: Print optimization progress
+            device: Computation device ('cpu', 'cuda', 'mps')
+        """
+        self.H_eff = H_eff.detach() if isinstance(H_eff, torch.Tensor) else H_eff
+        self.noise_power = noise_power
+        self.total_power = total_power
+        self.max_iterations = max_iterations
+        self.tolerance = tolerance
+        self.verbose = verbose
+        self.device = device
+        self.K = H_eff.shape[0]
+        self.sinr = []
+
+        # Channel gains |H_eff[k,k]|^2 for each user
+        self.channel_gains = torch.abs(torch.diag(self.H_eff))**2
+
+        # Optimization history
+        self.history = {
+            'sum_rate': [],
+            'power_change': []
+        }
+
+    def _compute_interference_plus_noise(self, power: torch.Tensor, user_k: int) -> float:
+        """
+        Compute interference plus noise for user k.
+
+        Args:
+            power: (K,) current power allocation
+            user_k: Index of user to compute interference for
+
+        Returns:
+            interference + noise for user k
+        """
+        interference = 0.0
+        for j in range(self.K):
+            if j != user_k:
+                # Interference from user j to user k
+                interference += power[j] * (torch.abs(self.H_eff[user_k, j])**2).item()
+
+        return interference + self.noise_power
+
+    def _compute_sum_rate(self, power: torch.Tensor, return_diagnostics: bool = False) -> Union[float, Dict]:
+        """
+        Compute sum-rate given power allocation.
+
+        Args:
+            power: (K,) power allocation
+            return_diagnostics: If True, return detailed per-user metrics
+
+        Returns:
+            If return_diagnostics=False: sum_rate (float)
+            If return_diagnostics=True: dict with:
+                - 'sum_rate': Total sum-rate in bits/s/Hz
+                - 'sinr_per_user': SINR for each user (list)
+                - 'snr_per_user': SNR for each user (signal/noise, no interference)
+                - 'rate_per_user': Individual rate for each user in bits/s/Hz
+                - 'power_per_user': Power allocation per user in Watts
+        """
+        sum_rate = 0.0
+        sinr_per_user = []
+        snr_per_user = []
+        rate_per_user = []
+        
+        for k in range(self.K):
+            # Signal power
+            signal_power = power[k] * self.channel_gains[k]
+            
+            # SNR (no interference)
+            snr = signal_power / self.noise_power
+            
+            # Interference power
+            interference = 0.0
+            for j in range(self.K):
+                if j != k:
+                    interference += power[j] * (torch.abs(self.H_eff[k, j])**2)
+            
+            # SINR (with interference)
+            sinr = signal_power / (interference + self.noise_power)
+            
+            # Rate for user k
+            rate_k = torch.log2(1 + sinr).item()
+            sum_rate += rate_k
+            
+            if return_diagnostics:
+                sinr_per_user.append(sinr.item() if isinstance(sinr, torch.Tensor) else sinr)
+                snr_per_user.append(snr.item() if isinstance(snr, torch.Tensor) else snr)
+                rate_per_user.append(rate_k)
+
+        if return_diagnostics:
+            return {
+                'sum_rate': sum_rate,
+                'sinr_per_user': sinr_per_user,
+                'snr_per_user': snr_per_user,
+                'rate_per_user': rate_per_user,
+                'power_per_user': power.cpu().numpy().tolist(),
+                'noise_power': self.noise_power
+            }
+        return sum_rate
+
+    def _water_fill_single_user(self, user_k: int, power: torch.Tensor, remaining_power: float) -> float:
+        """
+        Water-filling for a single user given interference from others.
+
+        Args:
+            user_k: Index of user to optimize power for
+            power: Current power allocation for all users
+            remaining_power: Available power for this user
+
+        Returns:
+            Optimal power for user k
+        """
+        # Interference + noise seen by user k
+        interference_noise = self._compute_interference_plus_noise(power, user_k)
+
+        # Channel gain for user k
+        gain_k = self.channel_gains[user_k].item()
+
+        # This is now not used in the new waterfilling approach
+        # We'll compute proper waterfilling in the optimize method
+
+        # For now, return a simple allocation based on channel quality
+        if gain_k > 1e-10:
+            # Allocate proportional to channel quality relative to noise+interference
+            quality_ratio = gain_k / (interference_noise + 1e-10)
+            return remaining_power * min(1.0, quality_ratio / 10.0)  # Scale factor to prevent overshooting
+        else:
+            return 0.0
+
+    def optimize(self, initial_power: Optional[torch.Tensor] = None) -> Dict:
+        """
+        Run iterative water-filling optimization.
+
+        Args:
+            initial_power: Initial power allocation (K,). If None, uses equal allocation.
+
+        Returns:
+            Dictionary with:
+                - 'optimal_power': Optimized power allocation (K,)
+                - 'optimal_sum_rate': Final sum-rate value
+                - 'iterations': Number of iterations performed
+                - 'converged': Whether algorithm converged
+                - 'history': Optimization history
+        """
+        # Initialize power
+        if initial_power is None:
+            power = torch.ones(self.K, device=self.device) * (self.total_power / self.K)
+        else:
+            power = initial_power.clone().detach()
+
+        # Reset history
+        self.history = {
+            'sum_rate': [],
+            'power_change': []
+        }
+
+        if self.verbose:
+            print("=" * 70)
+            print("Water-Filling Power Optimization")
+            print("=" * 70)
+            print(f"Number of users: {self.K}")
+            print(f"Total power: {self.total_power:.4f} W")
+            print(f"Max iterations: {self.max_iterations}")
+            print(f"Tolerance: {self.tolerance}")
+            print()
+
+        converged = False
+
+        for iteration in range(self.max_iterations):
+            power_old = power.clone()
+
+            # Compute interference for each user using previous iteration's power
+            interference = torch.zeros(self.K, device=self.device)
+            for k in range(self.K):
+                for j in range(self.K):
+                    if j != k:
+                        interference[k] += power_old[j] * torch.abs(self.H_eff[k, j])**2
+
+            # Add noise to interference
+            noise_plus_interference = interference + self.noise_power
+
+            # Compute effective channel gains divided by noise+interference
+            # This is the "depth" for waterfilling
+            effective_gains = self.channel_gains / noise_plus_interference
+
+            mu_min = 0.0
+            mu_max = self.total_power + torch.max(1.0 / effective_gains).item()
+
+            for _ in range(50):  # Binary search iterations
+                mu = (mu_min + mu_max) / 2
+
+                # Compute power with this water level
+                # Waterfilling formula: p_k = [μ - 1/effective_gain_k]⁺
+                powers_test = torch.clamp(mu - 1.0 / effective_gains, min=0.0)
+
+                total_test = powers_test.sum().item()
+
+                if abs(total_test - self.total_power) < 1e-6 * self.total_power:
+                    break
+                elif total_test < self.total_power:
+                    mu_min = mu
+                else:
+                    mu_max = mu
+
+            # Final power allocation with found water level
+            new_power = torch.clamp(mu - 1.0 / effective_gains, min=0.0)
+
+            # Normalize to ensure exact power constraint
+            power_sum = new_power.sum()
+            if power_sum > 0:
+                new_power = new_power * (self.total_power / power_sum)
+            else:
+                # If all zeros, use uniform allocation
+                new_power = torch.ones(self.K, device=self.device) * (self.total_power / self.K)
+
+            power = new_power
+
+            # Compute sum-rate
+            sum_rate = self._compute_sum_rate(power)
+
+            # Compute power change
+            power_change = torch.norm(power - power_old).item()
+
+            # Store history
+            self.history['sum_rate'].append(sum_rate)
+            self.history['power_change'].append(power_change)
+
+            # Check convergence
+            if power_change < self.tolerance:
+                converged = True
+                if self.verbose:
+                    print(f"\nConverged at iteration {iteration+1}")
+                    print(f"Power change: {power_change:.2e} < {self.tolerance:.2e}")
+                break
+
+            # Print progress
+            if self.verbose and (iteration % 10 == 0 or iteration == self.max_iterations - 1):
+                print(f"Iter {iteration:4d} | Sum-Rate: {sum_rate:12.6f} | "
+                      f"Power change: {power_change:10.6f}")
+
+        # Final sum-rate and diagnostics
+        diagnostics = self._compute_sum_rate(power=power, return_diagnostics=True)
+
+        if self.verbose:
+            print()
+            print("=" * 70)
+            print("Optimization Complete")
+            print("=" * 70)
+            print(f"Final sum-rate: {diagnostics['sum_rate']:.6f} bits/s/Hz")
+            print(f"SINR per user (linear): {[f'{s:.2f}' for s in diagnostics['sinr_per_user']]}")
+            print(f"SINR per user (dB): {[f'{10*np.log10(s):.2f}' for s in diagnostics['sinr_per_user']]}")
+            print(f"SNR per user (dB): {[f'{10*np.log10(s):.2f}' for s in diagnostics['snr_per_user']]}")
+            print(f"Rate per user: {[f'{r:.2f}' for r in diagnostics['rate_per_user']]} bits/s/Hz")
+            print(f"Iterations: {iteration+1}")
+            print(f"Converged: {converged}")
+            print(f"Power allocation: {power.cpu().numpy()}")
+            print(f"Total power used: {power.sum().item():.6f} W")
+            print()
+
+        return {
+            'optimal_power': power,
+            'optimal_sum_rate': diagnostics['sum_rate'],
+            'sinr_per_user': diagnostics['sinr_per_user'],
+            'snr_per_user': diagnostics['snr_per_user'],
+            'rate_per_user': diagnostics['rate_per_user'],
+            'power_per_user': diagnostics['power_per_user'],
+            'noise_power': diagnostics['noise_power'],
+            'iterations': iteration + 1,
+            'converged': converged,
+            'history': self.history
+        }
+
+    def plot_convergence(self, save_path: Optional[str] = None):
+        """
+        Plot water-filling convergence.
+
+        Args:
+            save_path: Optional path to save figure
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("Matplotlib not available for visualization")
+            return
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        # Plot sum-rate
+        ax = axes[0]
+        ax.plot(self.history['sum_rate'], 'b-', linewidth=2)
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('Sum-Rate (bits/s/Hz)')
+        ax.set_title('Water-Filling: Sum-Rate Evolution')
+        ax.grid(True, alpha=0.3)
+
+        # Plot power change
+        ax = axes[1]
+        ax.semilogy(self.history['power_change'], 'r-', linewidth=2)
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('Power Change (log scale)')
+        ax.set_title('Power Allocation Convergence')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Convergence plot saved to {save_path}")
+        else:
+            plt.show()
+
+# ========== Reinforcement Learning Algorithms ==========
+
+class ReplayBuffer:
+    """Experience replay buffer for RL algorithms."""
+    def __init__(self, capacity: int = 100000):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size: int):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = zip(*batch)
+        return (np.array(state), np.array(action), np.array(reward),
+                np.array(next_state), np.array(done))
+    
+    def __len__(self):
+        return len(self.buffer)
+
+
+class Actor(nn.Module):
+    """Actor network with configurable output type."""
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, output_type: str = 'phases'):
+        """
+        Args:
+            state_dim: State dimension
+            action_dim: Action dimension
+            hidden_dim: Hidden layer size
+            output_type: Type of output - 'phases', 'power', or 'both'
+        """
+        super(Actor, self).__init__()
+        self.output_type = output_type
+        self.action_dim = action_dim
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        output = self.fc3(x)
+
+        if self.output_type == 'phases':
+            # Phases: [0, 2π]
+            return torch.sigmoid(output) * 2 * np.pi
+        elif self.output_type == 'power':
+            # Power: use softmax for sum constraint (ensures sum=1)
+            return F.softmax(output, dim=-1)
+        else:
+            raise ValueError(f"Unknown output_type: {self.output_type}")
+
+
+class Critic(nn.Module):
+    """Critic Q(s,a) network."""
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+        super(Critic, self).__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+    
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+class TwinCritic(nn.Module):
+    """Twin critics for TD3."""
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+        super(TwinCritic, self).__init__()
+        self.fc1_1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc2_1 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3_1 = nn.Linear(hidden_dim, 1)
+        self.fc1_2 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc2_2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3_2 = nn.Linear(hidden_dim, 1)
+    
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=1)
+        q1 = F.relu(self.fc1_1(x))
+        q1 = F.relu(self.fc2_1(q1))
+        q1 = self.fc3_1(q1)
+        q2 = F.relu(self.fc1_2(x))
+        q2 = F.relu(self.fc2_2(q2))
+        q2 = self.fc3_2(q2)
+        return q1, q2
+    
+    def Q1(self, state, action):
+        x = torch.cat([state, action], dim=1)
+        q1 = F.relu(self.fc1_1(x))
+        q1 = F.relu(self.fc2_1(q1))
+        return self.fc3_1(q1)
+
+
+class DDPG:
+    """Deep Deterministic Policy Gradient for SIM optimization (phases, power, or both)."""
+    def __init__(self, beamformer: Beamformer, state_dim: int, action_dim: int,
+                 hidden_dim: int = 256, actor_lr: float = 1e-4, critic_lr: float = 1e-3,
+                 gamma: float = 0.99, tau: float = 0.005, buffer_size: int = 100000,
+                 batch_size: int = 64, noise_std: float = 0.1,
+                 optimize_target: str = 'phases', verbose: bool = True):
+        """
+        Args:
+            optimize_target: What to optimize - 'phases' or 'power'
+                - 'phases': optimize SIM phases (action_dim = L*N)
+                - 'power': optimize power allocation (action_dim = K)
+        """
+        self.beamformer = beamformer
+        self.device = beamformer.device
+        self.action_dim = action_dim
+        self.optimize_target = optimize_target
+        self.gamma = gamma
+        self.tau = tau
+        self.batch_size = batch_size
+        self.noise_std = noise_std
+        self.verbose = verbose
+
+        # Determine output type for actor
+        output_type = optimize_target
+
+        self.actor = Actor(state_dim, action_dim, hidden_dim, output_type).to(self.device)
+        self.actor_target = Actor(state_dim, action_dim, hidden_dim, output_type).to(self.device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+
+        self.critic = Critic(state_dim, action_dim, hidden_dim).to(self.device)
+        self.critic_target = Critic(state_dim, action_dim, hidden_dim).to(self.device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.replay_buffer = ReplayBuffer(buffer_size)
+        self.history = {'episode_rewards': [], 'actor_loss': [], 'critic_loss': []}
+    
+    def select_action(self, state: np.ndarray, add_noise: bool = True) -> np.ndarray:
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action = self.actor(state_tensor).cpu().numpy()[0]
+
+        if add_noise:
+            if self.optimize_target == 'phases':
+                # Add noise for phases and clip to [0, 2π]
+                action = np.clip(action + np.random.normal(0, self.noise_std, action.shape), 0, 2 * np.pi)
+            elif self.optimize_target == 'power':
+                # For power, actor already outputs valid distribution via softmax
+                # Add small noise and renormalize
+                noise = np.random.normal(0, self.noise_std * 0.1, action.shape)
+                action = np.maximum(action + noise, 0)  # Ensure non-negative
+                action = action / action.sum()  # Renormalize to sum to 1
+
+        return action
+    
+    def update(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return None, None
+        state, action, reward, next_state, done = self.replay_buffer.sample(self.batch_size)
+        state = torch.FloatTensor(state).to(self.device)
+        action = torch.FloatTensor(action).to(self.device)
+        reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
+        next_state = torch.FloatTensor(next_state).to(self.device)
+        done = torch.FloatTensor(done).unsqueeze(1).to(self.device)
+        
+        with torch.no_grad():
+            next_action = self.actor_target(next_state)
+            target_Q = self.critic_target(next_state, next_action)
+            target_Q = reward + (1 - done) * self.gamma * target_Q
+        
+        current_Q = self.critic(state, action)
+        critic_loss = F.mse_loss(current_Q, target_Q)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        
+        actor_loss = -self.critic(state, self.actor(state)).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        
+        return actor_loss.item(), critic_loss.item()
+    
+    def optimize(self, num_episodes: int = 500, steps_per_episode: int = 50,
+                 power_allocation: Optional[torch.Tensor] = None,
+                 initial_phases: Optional[torch.Tensor] = None,
+                 warmup_episodes: int = 50) -> Dict:
+        """
+        Optimize SIM phases using DDPG.
+
+        Args:
+            power_allocation: Fixed power allocation for all users
+            initial_phases: Starting phases for warm-start (shape: L x N)
+            warmup_episodes: Number of episodes to explore around initial phases (default 50)
+        """
+        if power_allocation is None:
+            power_allocation = torch.ones(self.beamformer.num_users, device=self.device) * (self.beamformer.total_power / self.beamformer.num_users)
+        power_allocation_fixed = power_allocation
+
+        if self.verbose:
+            print("=" * 70)
+            print(f"DDPG Training (optimizing phases)")
+            print("=" * 70)
+
+        best_reward = -float('inf')
+        best_params = None
+        initial_action = None
+
+        # Initialize with starting point if provided
+        if initial_phases is not None:
+            best_params = initial_phases.clone().detach()
+            best_reward = self.beamformer.compute_sum_rate(initial_phases, power_allocation_fixed).item()
+            initial_action = initial_phases.flatten().cpu().numpy()
+            if self.verbose:
+                print(f"Warm-start from initial_phases with sum-rate: {best_reward:.6f}")
+                print(f"Using initial phases as base for first {warmup_episodes} episodes")
+
+            # Pre-seed replay buffer with experiences around initial point
+            H_eff = self.beamformer.H.flatten()
+            state = torch.cat([H_eff.real, H_eff.imag, power_allocation_fixed]).cpu().numpy()
+
+            for _ in range(self.batch_size):
+                noise = np.random.normal(0, self.noise_std * 0.3, initial_action.shape)
+                action_var = np.clip(initial_action + noise, 0, 2 * np.pi)
+                phases_var = torch.FloatTensor(action_var).reshape(
+                    self.beamformer.sim_model.layers, self.beamformer.sim_model.metaAtoms
+                ).to(self.device)
+                reward = self.beamformer.compute_sum_rate(phases_var, power_allocation_fixed).item()
+                self.replay_buffer.push(state, action_var, reward, state, False)
+
+            if self.verbose:
+                print(f"Pre-seeded replay buffer with {self.batch_size} experiences around initial point")
+
+        for episode in range(num_episodes):
+            H_eff = self.beamformer.H.flatten()
+            state = torch.cat([H_eff.real, H_eff.imag, power_allocation_fixed]).cpu().numpy()
+
+            episode_reward = 0
+
+            for step in range(steps_per_episode):
+                # Warm-start: explore around initial phases during warmup period
+                if initial_action is not None and episode < warmup_episodes:
+                    warmup_progress = episode / warmup_episodes
+                    noise_scale = 0.3 + 0.7 * warmup_progress
+                    noise = np.random.normal(0, self.noise_std * noise_scale, initial_action.shape)
+                    action = np.clip(initial_action + noise, 0, 2 * np.pi)
+                else:
+                    action = self.select_action(state, add_noise=True)
+
+                phases_current = torch.FloatTensor(action).reshape(
+                    self.beamformer.sim_model.layers, self.beamformer.sim_model.metaAtoms
+                ).to(self.device)
+                reward = self.beamformer.compute_sum_rate(phases_current, power_allocation_fixed).item()
+
+                episode_reward += reward
+
+                self.replay_buffer.push(state, action, reward, state, step == steps_per_episode - 1)
+                actor_loss, critic_loss = self.update()
+
+                if actor_loss is not None:
+                    self.history['actor_loss'].append(actor_loss)
+                    self.history['critic_loss'].append(critic_loss)
+
+            avg_reward = episode_reward / steps_per_episode
+            self.history['episode_rewards'].append(avg_reward)
+
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                best_action = self.select_action(state, add_noise=False)
+                best_params = torch.FloatTensor(best_action).reshape(
+                    self.beamformer.sim_model.layers, self.beamformer.sim_model.metaAtoms
+                ).to(self.device)
+
+            if self.verbose and episode % 10 == 0:
+                print(f"Episode {episode:4d} | Reward: {avg_reward:10.4f} | Best: {best_reward:10.4f}")
+
+        if self.verbose:
+            print(f"\nBest sum-rate: {best_reward:.6f} bits/s/Hz\n")
+
+        return {'optimal_params': best_params, 'optimal_objective': best_reward, 'history': self.history}
+
+
+class TD3:
+    """Twin Delayed DDPG for SIM phase optimization."""
+    def __init__(self, beamformer: Beamformer, state_dim: int, action_dim: int,
+                 hidden_dim: int = 256, actor_lr: float = 1e-4, critic_lr: float = 1e-3,
+                 gamma: float = 0.99, tau: float = 0.005, policy_noise: float = 0.2,
+                 noise_clip: float = 0.5, policy_delay: int = 2, buffer_size: int = 100000,
+                 batch_size: int = 64, noise_std: float = 0.1, verbose: bool = True):
+        """
+        Args:
+            beamformer: Beamformer instance
+            state_dim: Dimension of state space (2*K*N + K for channel + power)
+            action_dim: Dimension of action space (L*N for phases)
+            noise_std: Standard deviation for exploration noise
+        """
+        self.beamformer = beamformer
+        self.device = beamformer.device
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.tau = tau
+        self.policy_noise = policy_noise
+        self.noise_clip = noise_clip
+        self.policy_delay = policy_delay
+        self.batch_size = batch_size
+        self.noise_std = noise_std
+        self.verbose = verbose
+        self.total_it = 0
+
+        self.actor = Actor(state_dim, action_dim, hidden_dim, 'phases').to(self.device)
+        self.actor_target = Actor(state_dim, action_dim, hidden_dim, 'phases').to(self.device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+
+        self.critic = TwinCritic(state_dim, action_dim, hidden_dim).to(self.device)
+        self.critic_target = TwinCritic(state_dim, action_dim, hidden_dim).to(self.device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+
+        self.replay_buffer = ReplayBuffer(buffer_size)
+        self.history = {'episode_rewards': [], 'actor_loss': [], 'critic_loss': []}
+
+    def select_action(self, state: np.ndarray, add_noise: bool = True) -> np.ndarray:
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action = self.actor(state_tensor).cpu().numpy()[0]
+
+        if add_noise:
+            action = np.clip(action + np.random.normal(0, self.noise_std, action.shape), 0, 2 * np.pi)
+
+        return action
+
+    def update(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return None, None
+
+        self.total_it += 1
+        state, action, reward, next_state, done = self.replay_buffer.sample(self.batch_size)
+        state = torch.FloatTensor(state).to(self.device)
+        action = torch.FloatTensor(action).to(self.device)
+        reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
+        next_state = torch.FloatTensor(next_state).to(self.device)
+        done = torch.FloatTensor(done).unsqueeze(1).to(self.device)
+
+        with torch.no_grad():
+            noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            next_action = self.actor_target(next_state) + noise
+            next_action = next_action.clamp(0, 2 * np.pi)
+
+            target_Q1, target_Q2 = self.critic_target(next_state, next_action)
+            target_Q = reward + (1 - done) * self.gamma * torch.min(target_Q1, target_Q2)
+
+        current_Q1, current_Q2 = self.critic(state, action)
+        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        actor_loss = None
+        if self.total_it % self.policy_delay == 0:
+            actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+            for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+            actor_loss = actor_loss.item()
+
+        return actor_loss, critic_loss.item()
+
+    def optimize(self, num_episodes: int = 500, steps_per_episode: int = 50,
+                 power_allocation: Optional[torch.Tensor] = None,
+                 initial_phases: Optional[torch.Tensor] = None,
+                 warmup_episodes: int = 50) -> Dict:
+        """
+        Optimize SIM phases using TD3.
+
+        Args:
+            power_allocation: Fixed power allocation for all users
+            initial_phases: Starting phases for warm-start (shape: L x N)
+            warmup_episodes: Number of episodes to explore around initial phases (default 50)
+        """
+        if power_allocation is None:
+            power_allocation = torch.ones(self.beamformer.num_users, device=self.device) * (self.beamformer.total_power / self.beamformer.num_users)
+        power_allocation_fixed = power_allocation
+
+        if self.verbose:
+            print("=" * 70)
+            print(f"TD3 Training (optimizing phases)")
+            print("=" * 70)
+
+        best_reward = -float('inf')
+        best_params = None
+        initial_action = None
+
+        # Initialize with starting point if provided
+        if initial_phases is not None:
+            best_params = initial_phases.clone().detach()
+            best_reward = self.beamformer.compute_sum_rate(initial_phases, power_allocation_fixed).item()
+            initial_action = initial_phases.flatten().cpu().numpy()
+            if self.verbose:
+                print(f"Warm-start from initial_phases with sum-rate: {best_reward:.6f}")
+                print(f"Using initial phases as base for first {warmup_episodes} episodes")
+
+            # Pre-seed replay buffer with experiences around initial point
+            H_eff = self.beamformer.H.flatten()
+            state = torch.cat([H_eff.real, H_eff.imag, power_allocation_fixed]).cpu().numpy()
+
+            for _ in range(self.batch_size):
+                noise = np.random.normal(0, self.noise_std * 0.3, initial_action.shape)
+                action_var = np.clip(initial_action + noise, 0, 2 * np.pi)
+                phases_var = torch.FloatTensor(action_var).reshape(
+                    self.beamformer.sim_model.layers, self.beamformer.sim_model.metaAtoms
+                ).to(self.device)
+                reward = self.beamformer.compute_sum_rate(phases_var, power_allocation_fixed).item()
+                self.replay_buffer.push(state, action_var, reward, state, False)
+
+            if self.verbose:
+                print(f"Pre-seeded replay buffer with {self.batch_size} experiences around initial point")
+
+        for episode in range(num_episodes):
+            H_eff = self.beamformer.H.flatten()
+            state = torch.cat([H_eff.real, H_eff.imag, power_allocation_fixed]).cpu().numpy()
+
+            episode_reward = 0
+
+            for step in range(steps_per_episode):
+                # Warm-start: explore around initial phases during warmup period
+                if initial_action is not None and episode < warmup_episodes:
+                    warmup_progress = episode / warmup_episodes
+                    noise_scale = 0.3 + 0.7 * warmup_progress
+                    noise = np.random.normal(0, self.noise_std * noise_scale, initial_action.shape)
+                    action = np.clip(initial_action + noise, 0, 2 * np.pi)
+                else:
+                    action = self.select_action(state, add_noise=True)
+
+                phases_current = torch.FloatTensor(action).reshape(
+                    self.beamformer.sim_model.layers, self.beamformer.sim_model.metaAtoms
+                ).to(self.device)
+                reward = self.beamformer.compute_sum_rate(phases_current, power_allocation_fixed).item()
+
+                episode_reward += reward
+
+                self.replay_buffer.push(state, action, reward, state, step == steps_per_episode - 1)
+                actor_loss, critic_loss = self.update()
+
+                if actor_loss is not None:
+                    self.history['actor_loss'].append(actor_loss)
+                if critic_loss is not None:
+                    self.history['critic_loss'].append(critic_loss)
+
+            avg_reward = episode_reward / steps_per_episode
+            self.history['episode_rewards'].append(avg_reward)
+
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                best_action = self.select_action(state, add_noise=False)
+                best_params = torch.FloatTensor(best_action).reshape(
+                    self.beamformer.sim_model.layers, self.beamformer.sim_model.metaAtoms
+                ).to(self.device)
+
+            if self.verbose and episode % 10 == 0:
+                print(f"Episode {episode:4d} | Reward: {avg_reward:10.4f} | Best: {best_reward:10.4f}")
+
+        if self.verbose:
+            print(f"\nBest sum-rate: {best_reward:.6f} bits/s/Hz\n")
+
+        return {'optimal_params': best_params, 'optimal_objective': best_reward, 'history': self.history}

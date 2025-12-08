@@ -12,6 +12,33 @@ class UserChannel:
     - Angular velocity (user rotation/movement)
     - Angle noise (random angular variations)
     - Configurable small-scale fading (Rayleigh/Rician)
+
+    Available Attributes (via self):
+        .num_users (int): Number of users K
+        .wavelength (float): Operating wavelength in meters
+        .reference_distance (float): Reference distance for path loss (meters)
+        .path_loss_at_reference (float): Path loss at reference distance (dB)
+        .min_user_distance (float): Minimum user distance for CLT mode (meters)
+        .max_user_distance (float): Maximum user distance for CLT mode (meters)
+        .device (str): Computation device ('cpu', 'cuda', 'mps')
+        .user_positions (np.ndarray or None): User positions (K, 3) [x, y, z] if set
+        .path_loss_exponents (np.ndarray): Path loss exponent per user (K,), default=2.0
+        .ricean_k_factors (np.ndarray): Rician K-factor per user (K,) in linear scale
+
+    Available Methods:
+        .generate_channel(positions, time=0.0) -> torch.Tensor:
+            Generates channel matrix H (K, M) using CLT or specified positions
+            Args: positions (torch.Tensor or np.ndarray) (M, 3), time (float)
+            Returns: Complex channel matrix (K, M)
+
+        .set_user_positions(positions):
+            Sets fixed user positions
+            Args: positions (np.ndarray) (K, 3)
+
+        .compute_path_loss(distance) -> np.ndarray:
+            Computes path loss for given distances
+            Args: distance (np.ndarray) distances in meters
+            Returns: Path loss in linear scale (not dB)
     """
 
     def __init__(self,
@@ -225,6 +252,18 @@ class UserChannel:
             user_distances = np.random.uniform(self.min_user_distance,
                                               self.max_user_distance,
                                               K)
+            
+            #this is just to match to the reference paper 
+            x = np.random.uniform(self.min_user_distance,
+                                              self.max_user_distance,
+                                              K)
+            y = np.random.uniform(self.min_user_distance,
+                                              self.max_user_distance,
+                                              K)
+            user_distances = np.sqrt(x**2 + y**2)
+
+            
+            
 
             # Reference path loss (C_0 in paper)
             path_loss_ref_linear = 10**(self.path_loss_at_reference / 10)

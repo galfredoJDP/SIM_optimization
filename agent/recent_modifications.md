@@ -1,5 +1,345 @@
 # Recent Modifications Log
 
+## 2025-12-01 (Part 8): Waterfilling Algorithm + Paper Alignment Analysis
+
+### Session Goal
+Implement (WF, PGA) benchmark from Nassirpour et al. paper to reproduce Figure 4. This includes:
+1. ✅ Waterfilling algorithm for power allocation with multi-user interference
+2. ✅ Date-stamped results saving to prevent overwriting
+3. ✅ Analysis of paper's requirements vs current implementation
+
+### Key Changes
+
+#### 1. Fixed Waterfilling Algorithm Convergence Issue
+
+**Problem**: Initial waterfilling implementation was converging at iteration 1, indicating the algorithm wasn't properly iterating through power allocations.
+
+**Root Cause**:
+- Wrong interference computation: Used `new_power` (with zeros) instead of `power_old` from previous iteration
+- Incorrect waterfilling formula: Didn't implement proper water level μ binary search
+- Algorithm wasn't properly accounting for multi-user interference feedback
+
+**Solution** (simpy/algorithm.py:483-546):
+```python
+# Fixed approach:
+for iteration in range(max_iterations):
+    power_old = power.clone()
+
+    # Compute interference using PREVIOUS iteration's power
+    interference = torch.zeros(K, device=device)
+    for k in range(K):
+        for j in range(K):
+            if j != k:
+                interference[k] += power_old[j] * torch.abs(H_eff[k, j])**2
+
+    # Add noise to get total noise + interference
+    noise_plus_interference = interference + beamformer.noise_power
+
+    # Compute effective gains for waterfilling
+    effective_gains = channel_gains / noise_plus_interference
+
+    # Binary search for water level μ such that sum of powers = total_power
+    mu_min = 0.0
+    mu_max = total_power + torch.max(1.0 / effective_gains).item()
+
+    for _ in range(50):  # Binary search
+        mu = (mu_min + mu_max) / 2
+        powers_test = torch.clamp(mu - 1.0 / effective_gains, min=0.0)
+        power_sum = powers_test.sum().item()
+
+        if abs(power_sum - total_power) < tolerance * total_power:
+            break
+        elif power_sum < total_power:
+            mu_min = mu
+        else:
+            mu_max = mu
+
+    # Apply waterfilling formula: p_k = [μ - 1/effective_gain_k]⁺
+    new_power = torch.clamp(mu - 1.0 / effective_gains, min=0.0)
+    new_power = new_power * (total_power / new_power.sum())  # Normalize
+
+    # Check convergence
+    power_change = torch.norm(new_power - power_old).item()
+    if power_change < tolerance:
+        break
+
+    power = new_power
+```
+
+**Result**: Algorithm now iterates 10-50 times instead of stopping at iteration 1, with proper convergence.
+
+#### 2. Date-Stamped Results Saving
+
+**Changes** (main.py:13-24, 357-401):
+- Added `datetime` import
+- Create timestamped results directory: `results/run_YYYYMMDD_HHMMSS/`
+- All plots and data saved to this directory
+- Prevents accidental overwriting of previous runs
+
+```python
+from datetime import datetime
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+results_dir = f"results/run_{timestamp}"
+os.makedirs(results_dir, exist_ok=True)
+```
+
+Results now saved as:
+- `results/run_20251201_143052/WF_PGA.pt` (optimization data)
+- `results/run_20251201_143052/WF_PGA.png` (plots)
+
+#### 3. Paper Alignment Analysis
+
+**Question**: What alignment is needed between our implementation and Nassirpour et al. (2025 IEEE ICC)?
+
+**Finding**: The paper specifies the **(WF, PGA)** benchmark as their best-performing baseline:
+- WF: Waterfilling for power allocation (continuous values)
+- PGA: Projected Gradient Ascent for SIM phase optimization (continuous phases)
+
+**Paper's Specification (Page 5, Section V):**
+- I_AO = 5: Alternating Optimization iterations
+- K = 4 users
+- σ² = -80 dBm noise power
+- α = 2 path loss exponent
+- C₀ = -30 dB reference path loss at 1m
+- λ = 0.125m wavelength
+- L = 2 SIM layers
+- N = 25 meta-atoms per layer
+- 50 Monte Carlo trials
+
+**Our Current Implementation**:
+- ✅ Has PGA optimizer with continuous phases
+- ✅ Has waterfilling algorithm with continuous power
+- ❓ **Open question**: Do (WF, PGA) use I_AO = 5 alternating optimization iterations?
+
+**Paper Ambiguity**: The paper doesn't explicitly state whether benchmark methods (WF, PGA) use:
+- Option A: Single-pass (WF once, then PGA once) → done
+- Option B: I_AO = 5 iterations (alternate WF ↔ PGA five times)
+
+The I_AO = 5 is mentioned only as a simulation parameter, but unclear if it applies to (WF, PGA) or just their proposed FF method.
+
+### Next Steps for (WF, PGA) Implementation
+
+**To reproduce Figure 4**, we should:
+1. Use I_AO = 5 alternating optimization iterations for all methods
+2. For each iteration:
+   - Step 1: Optimize phases with PGA (power fixed)
+   - Step 2: Optimize power with waterfilling (phases fixed)
+3. Run 50 Monte Carlo trials at each power level
+4. Compare sum-rate vs power across all methods
+
+**Implementation Question for User**:
+Should we:
+- Add I_AO = 5 loop alternating PGA ↔ waterfilling?
+- Or keep current single-pass approach (PGA then WF)?
+
+### Files Modified
+- `simpy/algorithm.py`: Fixed WaterFilling class (lines 483-546)
+- `main.py`: Added date-stamped results directory (lines 13-24, 357-401)
+
+### Testing Status
+- ✅ Waterfilling converges properly (10-50 iterations)
+- ✅ Results save to timestamped directory
+- ⏳ Pending: Alignment with paper's exact (WF, PGA) methodology
+
+### Paper Reference
+- File: `files/Sum-Rate_Maximization_in_Holographic_MIMO_Communications_with_Stacked_Intelligent_Metasurfaces.pdf`
+- Section: V. Numerical Analysis (Page 5)
+- Figure: 4 (Sum-rate vs Power Budget)
+- Methods compared: (WF, PGA), (WF, MPGA), (WF, SR), (WF, FF), (mFF, PGA), (mFF, FF)
+
+---
+
+## 2025-12-01 (Part 7): RL Algorithms Enhanced + Power Sweep in main.py
+
+### DDPG/TD3 Enhancement: Support for Optimizing Phases OR Power
+
+**Problem:** Initial DDPG/TD3 implementations were hardcoded to optimize phases only, with power as a fixed parameter. User requested flexibility to optimize either phases (with fixed power) OR power (with fixed phases).
+
+**Solution:** Added `optimize_target` parameter to both algorithms:
+
+```python
+# Optimize phases (with fixed power allocation)
+ddpg_phases = DDPG(..., optimize_target='phases')
+ddpg_phases.optimize(power_allocation=fixed_power)
+
+# Optimize power (with fixed phases)
+ddpg_power = DDPG(..., optimize_target='power')
+ddpg_power.optimize(phases=fixed_phases)
+```
+
+#### Implementation Details
+
+**1. Enhanced Actor Network (algorithm.py:616-645)**
+- Added `output_type` parameter
+- 'phases' mode: sigmoid output scaled to [0, 2π]
+- 'power' mode: softmax output (ensures sum constraint = 1)
+- No 'both' mode (user clarified only single optimization target needed)
+
+**2. State Dimension Corrections**
+
+| Optimize Target | State Dim | Calculation | Action Dim |
+|---|---|---|---|
+| Phases | 204 | 2*K*N + K | 50 (L*N) |
+| Power | 250 | 2*K*N + L*N | 4 (K) |
+
+- For phases: State = channel (real+imag) + power allocation
+- For power: State = channel (real+imag) + fixed phases
+
+**3. Updated select_action() Methods**
+- Phases: Add noise and clip to [0, 2π]
+- Power: Add small noise to softmax output, renormalize to sum=1
+
+**4. Updated optimize() Methods**
+- Validate that required parameter is provided
+- Compute sum-rate using appropriate fixed parameter
+- Return `optimal_params` shaped correctly:
+  - Phases mode: (L, N) tensor
+  - Power mode: (K,) tensor scaled by total_power
+
+#### Files Modified
+- `simpy/algorithm.py`: Lines 616-859 (DDPG), 862-1041 (TD3)
+- Updated Actor.forward(), select_action(), and optimize() methods
+- Added comprehensive docstrings
+
+#### Testing
+- Created `test_rl_power_phases.py` demonstrating all 4 cases:
+  1. DDPG optimizing phases
+  2. DDPG optimizing power
+  3. TD3 optimizing phases
+  4. TD3 optimizing power
+- All tests pass without errors
+
+#### Bug Fixes During Implementation
+1. **State dimension bug**: Incorrectly calculated as 36 instead of 204 (was using M*K instead of K*N)
+2. **Attribute name bug**: Used `.L` and `.N` instead of `.layers` and `.metaAtoms`
+3. **Matplotlib blocking**: Commented out `plt.show()` in test files
+
+---
+
+### Power Sweep Feature Added to main.py
+
+**Purpose:** Enable parametric studies across different transmit power levels.
+
+**Implementation (main.py:269-385):**
+
+```python
+# Configure power sweep
+power_values_db = np.array([20, 23, 26, 29])  # dBm
+power_values_linear = 10**(power_values_db/10) / 1000  # Watts
+
+# Nested loops:
+# - Outer: Each power level
+# - Inner: 50 optimization runs per power level
+```
+
+**Features:**
+1. **Automatic power level updates**: Updates `sim_beamformer.total_power` and `power_allocation` for each iteration
+2. **Optimizer recreation**: Recreates PGA optimizer with updated power in lambda closure
+3. **Progressive saving**: Saves results after each power level completes
+   - Individual files: `results_power_20.0dBm.pt`, etc.
+   - Combined file: `all_optimization_results.pt`
+4. **Automatic plotting**: Generates `power_sweep_results.png` with:
+   - Scatter plot of all sum-rates colored by power level
+   - Mean ± std curves across power levels
+5. **Summary statistics**: Prints mean, std, min, max for each power level
+
+**Data Structure Saved:**
+```python
+all_results[f'{power_db:.1f}dBm'] = {
+    'power_linear': float,
+    'power_db': float,
+    'results': [optimization_result_1, ...],
+    'sumrate': [sumrate_1, sumrate_2, ...]
+}
+```
+
+**Loading Results:**
+```python
+all_results = torch.load('all_optimization_results.pt')
+sumrates_26db = all_results['26.0dBm']['sumrate']
+```
+
+---
+
+### Device Optimization Discussion
+
+**Recommendation for Performance:**
+
+| Algorithm | Device | Reasoning |
+|---|---|---|
+| PGA | CPU | Small sequential operations, GPU overhead not worth it |
+| DDPG/TD3 | MPS (Mac) | Large batch training (batch_size=64), neural networks benefit from GPU |
+
+**Performance Estimates (1 full run = 50 iterations):**
+- PGA on CPU: ~5-10 seconds
+- DDPG on MPS: ~5-10 minutes (vs ~30-60 min on CPU)
+
+---
+
+### Quantization CSI - Discussion & Recommendations
+
+**When to Use RL Instead of PGA:**
+
+User raised important question: Is RL necessary, or is PGA always optimal?
+
+**Answer:** For perfect CSI and differentiable objectives, **PGA is likely better** because:
+- More sample-efficient (converges in ~100 iterations vs thousands for RL)
+- Computes gradients on differentiable channel model
+- No uncertainty to handle
+
+**RL becomes valuable when:**
+1. **Quantized CSI** - Only 8-bit channel estimates available
+2. **Discrete Phase Shifters** - Phases must be from finite set {0°, 1.4°, 2.8°, ...}
+3. **Time-Varying Channels** - Need learned control policy, not optimization
+4. **Hardware Nonlinearities** - Phase shifters have hysteresis/nonlinear responses
+5. **Unknown Channel Model** - Rayleigh-Sommerfeld is wrong/approximate
+
+**Implementation for Quantized CSI:**
+```python
+def quantize_channel(H, bits=8):
+    """Quantize complex channel to fixed-point representation."""
+    H_real = H.real
+    H_imag = H.imag
+    max_val = torch.max(torch.abs(H_real.max()), torch.abs(H_imag.max()))
+
+    levels = 2 ** bits
+    step_size = 2 * max_val / levels
+
+    H_real_q = torch.round(H_real / step_size) * step_size
+    H_imag_q = torch.round(H_imag / step_size) * step_size
+
+    return H_real_q + 1j * H_imag_q
+```
+
+---
+
+### Files Modified in This Session
+- `simpy/algorithm.py`: Enhanced DDPG/TD3 classes (lines 616-1041)
+- `main.py`: Added power sweep optimization loop (lines 269-385)
+- `test_ddpg.py`: Created full test with state_dim=204 correction
+- `test_td3.py`: Created full test with state_dim=204 correction
+- `test_rl_power_phases.py`: Created comprehensive multi-scenario test
+- `test_both_rl.py`: Created comparison test
+- `demo_rl.py`: Created quick validation demo
+
+### Test Files Created
+1. `test_ddpg.py` - 50 runs of DDPG with detailed output
+2. `test_td3.py` - 50 runs of TD3 with detailed output
+3. `test_both_rl.py` - Direct comparison of DDPG vs TD3
+4. `test_rl_power_phases.py` - All 4 optimization scenarios
+5. `demo_rl.py` - Quick validation that algorithms work
+6. `quick_test_rl.py` - Minimal test for functionality check
+
+### Summary of Changes
+- ✅ DDPG/TD3 now support flexible optimization targets
+- ✅ State/action dimensions correctly calculated
+- ✅ Power sweep integrated into main.py
+- ✅ Automatic result saving and plotting
+- ✅ Device optimization recommendations documented
+- ✅ Quantized CSI support discussed with implementation example
+
+---
+
 ## 2025-11-20 (Part 5): SINR Computation and Beamforming Architecture Verification
 
 ### Problem

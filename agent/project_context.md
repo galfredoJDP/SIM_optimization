@@ -153,6 +153,49 @@ From paper page 2:
 - Interference: antennas k'≠k → SIM → user k
 - Results in (K, K) effective channel naturally
 
+## Current Objectives (2025-12-01)
+
+### Primary Goal: Reproduce Paper's Figure 4 (Sum-Rate vs Power)
+
+**Benchmark Method: (WF, PGA)**
+- WF: Waterfilling algorithm for continuous power allocation
+- PGA: Projected Gradient Ascent for continuous phase optimization
+
+**Paper Reference**: Nassirpour et al. (2025 IEEE ICC) - Section V, Page 5
+
+**Required Implementation**:
+1. ✅ Waterfilling with multi-user interference accounting
+2. ✅ PGA for phase optimization
+3. ❓ Alternating Optimization loop: I_AO = 5 iterations?
+4. ✅ Date-stamped results saving
+5. ⏳ Power sweep across multiple power levels
+
+**Current Status**:
+- Waterfilling algorithm fixed and converging properly (10-50 iterations)
+- Results saving to timestamped directory: `results/run_YYYYMMDD_HHMMSS/`
+- Main loop structure ready for alternating optimization implementation
+- **Pending Decision**: Add I_AO = 5 loop or keep single-pass approach?
+
+### Key Paper Ambiguity
+
+The paper doesn't explicitly state whether benchmark methods (WF, PGA) use:
+- **Option A**: Single-pass (PGA once, WF once)
+- **Option B**: I_AO = 5 iterations (alternate PGA ↔ WF five times)
+
+The parameter I_AO = 5 is mentioned but only as simulation setting, unclear if it applies to all methods or just the proposed FF/mFF method.
+
+**Current Implementation**: Single-pass (PGA → WF → done per run)
+
+### Waterfilling Algorithm Details
+
+**Fixed in Latest Session**:
+- Proper multi-user interference computation using power_old
+- Correct waterfilling formula with binary search for water level μ
+- Now converges over 10-50 iterations with proper power updates
+- Handles interference coupling between users
+
+**Convergence Check**: Monitors power change between iterations, stops when < tolerance
+
 ## Common Operations
 
 ### Initialize Beamformer

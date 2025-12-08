@@ -6,6 +6,36 @@ from simpy.util.util import complex_matmul
 class Transceiver:
     """
     Rectangular antenna array transceiver with grating lobe suppression.
+
+    Available Attributes (via self):
+        .Nx (int): Number of antenna elements in x-direction
+        .Ny (int): Number of antenna elements in y-direction
+        .num_antennas (int): Total number of antennas M = Nx * Ny
+        .wavelength (float): Operating wavelength in meters
+        .device (str): Computation device ('cpu', 'cuda', 'mps')
+        .spacing_x (float): Antenna spacing in x-direction (meters)
+        .spacing_y (float): Antenna spacing in y-direction (meters)
+        .antenna_positions (torch.Tensor): Antenna positions (M, 3) in [x, y, z]
+        .beamforming_weights (torch.Tensor or None): Current beamforming weights (M, K)
+
+    Available Methods:
+        .get_positions() -> torch.Tensor:
+            Returns antenna positions (M, 3)
+
+        .compute_zf_weights(channel) -> torch.Tensor:
+            Computes Zero-Forcing beamforming weights W = H^H(HH^H)^(-1)
+            Args: channel (K, M) - channel matrix
+            Returns: weights (M, K) - ZF weights
+
+        .compute_mrt_weights(channel) -> torch.Tensor:
+            Computes Maximum Ratio Transmission weights W = H^H
+            Args: channel (K, M) - channel matrix
+            Returns: weights (M, K) - MRT weights
+
+        .compute_sinr_downlink(effective_channel, power, noise_power) -> torch.Tensor:
+            Computes SINR for downlink transmission
+            Args: effective_channel (K, K), power (K,), noise_power (float)
+            Returns: SINR per user (K,)
     """
 
     def __init__(self,
@@ -182,7 +212,8 @@ class Transceiver:
                               channel: torch.Tensor,
                               power_allocation: torch.Tensor,
                               noise_power: float,
-                              beamforming_weights : Optional[torch.Tensor] = None) -> torch.Tensor:
+                              beamforming_weights : Optional[torch.Tensor] = None,
+                              debug: bool = False) -> torch.Tensor:
         """
         Compute SINR for each user in downlink with beamforming.
 
@@ -192,11 +223,12 @@ class Transceiver:
             channel: (K, A) complex tensor - channel from antennas to users
             power_allocation: (K,) tensor - transmit power for each user
             noise_power: scalar - noise power σ^2
+            debug: if True, print debug information
 
         Returns:
             sinr: (K,) tensor - SINR for each user
         """
-        
+
 
         # Save the effective channel used for this computation
         self.last_effective_channel = channel
@@ -205,6 +237,13 @@ class Transceiver:
 
         # Compute signal and interference powers
         sinr = torch.zeros(K, dtype=torch.float32, device=self.device)
+
+        if debug:
+            print(f"\n[DEBUG compute_sinr_downlink]")
+            print(f"  channel shape: {channel.shape}")
+            print(f"  channel diagonal: {torch.abs(torch.diag(channel)).cpu().numpy()}")
+            print(f"  power_allocation: {power_allocation.cpu().numpy()}")
+            print(f"  noise_power: {noise_power}")
 
         for k in range(K):
             # Signal power: P_k * |h_k^H w_k|^2
@@ -218,6 +257,14 @@ class Transceiver:
 
             # SINR
             sinr[k] = signal_power / (interference_power + noise_power)
+
+            if debug and k == 0:
+                print(f"\n  User 0:")
+                print(f"    signal_power = {power_allocation[k].item():.4e} * {torch.abs(channel[k, k]).item()**2:.4e} = {signal_power.item():.4e}")
+                print(f"    interference_power = {interference_power:.4e}")
+                print(f"    noise_power = {noise_power:.4e}")
+                print(f"    denominator = {(interference_power + noise_power):.4e}")
+                print(f"    SINR = {sinr[k].item():.4f}")
 
         return sinr
 
@@ -241,7 +288,7 @@ class Transceiver:
 
         return weights
 
-    def compute_zf_weights(self, channel: torch.Tensor) -> torch.Tensor:
+    def compute_zf_weights(self, channel: torch.Tensor, normalize: bool = True) -> torch.Tensor:
         """
         Compute Zero-Forcing (ZF) beamforming weights.
         ZF: W = H^H (H H^H)^{-1}
@@ -249,6 +296,7 @@ class Transceiver:
         Args:
             channel: (K, A) complex tensor - channel from A antennas to K users
                      Requires A >= K (more antennas than users)
+            normalize: If True, normalize channel before ZF computation for numerical stability
 
         Returns:
             weights: (A, K) complex tensor - ZF beamforming weights
@@ -258,15 +306,39 @@ class Transceiver:
         if A < K:
             raise ValueError(f"ZF requires A >= K antennas. Got A={A}, K={K}")
 
-        # W = H^H (H H^H)^{-1}
         H = channel  # (K, A)
+
+        # Normalize channel for numerical stability
+        if normalize:
+            # Compute scaling factor (Frobenius norm)
+            channel_scale = torch.norm(H)
+
+            if channel_scale < 1e-10:
+                raise ValueError(f"Channel norm too small: {channel_scale:.4e}. Cannot compute ZF weights.")
+
+            # Normalize channel
+            H_norm = H / channel_scale
+        else:
+            H_norm = H
+            channel_scale = 1.0
+
+        # W = H^H (H H^H)^{-1} on normalized channel
         # Use complex_matmul for MPS compatibility
-        HHH = complex_matmul(H, H.conj().T)  # (K, K)
+        HHH = complex_matmul(H_norm, H_norm.conj().T)  # (K, K)
 
         # Add small regularization for numerical stability
-        HHH_inv = torch.linalg.inv(HHH + 1e-8 * torch.eye(K, dtype=H.dtype, device=self.device))
+        # Adaptive regularization based on matrix magnitude
+        reg = 1e-8 * torch.mean(torch.abs(torch.diag(HHH)))
+        HHH_inv = torch.linalg.inv(HHH + reg * torch.eye(K, dtype=H.dtype, device=self.device))
 
-        # Use complex_matmul for MPS compatibility
-        weights = complex_matmul(H.conj().T, HHH_inv)  # (A, K)
+        # Compute weights on normalized channel
+        weights_norm = complex_matmul(H_norm.conj().T, HHH_inv)  # (A, K)
+
+        # Scale back weights: W = W_norm / scale
+        # This ensures H @ W ≈ I (not scale * I)
+        if normalize:
+            weights = weights_norm / channel_scale
+        else:
+            weights = weights_norm
 
         return weights

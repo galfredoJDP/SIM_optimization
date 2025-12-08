@@ -8,6 +8,47 @@ from simpy.util.util import findDistance
 
 
 class Sim(object):
+    """
+    Stacked Intelligent Metasurface (SIM) model.
+
+    Implements multi-layer reconfigurable metasurface with phase shifters.
+    Uses Rayleigh-Sommerfeld diffraction for wave propagation between layers.
+
+    Available Attributes (via self):
+        .layers (int): Number of metasurface layers L
+        .metaAtoms (int): Number of meta-atoms per layer N
+        .metaAtomArea (float): Area of each meta-atom (dx·dy) in m²
+        .layerSpacing (float): Distance between layers in meters
+        .metaAtomsSpacing (float): Distance between meta-atoms in meters
+        .wavelength (float): Operating wavelength λ in meters
+        .device (str): Computation device ('cpu', 'cuda', 'mps')
+        .metaAtomPositions (List[torch.Tensor]): Positions of meta-atoms per layer
+                                                  List of L tensors, each (N, 3)
+        .metaAtomPhase (torch.Tensor): Current phase configuration (L, N)
+        .W (List[torch.Tensor]): Rayleigh-Sommerfeld propagation matrices
+                                 List of (L-1) tensors, each (N, N) complex
+        .Theta (List[torch.Tensor]): Phase shift matrices per layer
+                                     List of L tensors, each (N, N) diagonal
+        .Psi (torch.Tensor): Full SIM propagation matrix (N, N) complex
+                            Psi = Θ[L]·W[L]·Θ[L-1]·...·W[2]·Θ[1]
+
+    Available Methods:
+        .forward(phases) -> torch.Tensor:
+            Computes SIM propagation matrix Ψ for given phases (differentiable)
+            Args: phases (L, N) - phase configuration
+            Returns: Psi (N, N) - complex propagation matrix
+
+        .get_first_layer_positions() -> torch.Tensor:
+            Returns positions of first layer meta-atoms (N, 3)
+
+        .get_last_layer_positions() -> torch.Tensor:
+            Returns positions of last layer meta-atoms (N, 3)
+
+        .update_phases(phases):
+            Updates phase configuration and recomputes Psi
+            Args: phases (L, N) - new phase values
+    """
+
     def __init__(self, layers: int, metaAtoms: int, layerSpacing: float,
                  metaAtomSpacing: float, metaAtomArea: float, wavelength: float, device : str) -> None:
         """
@@ -20,6 +61,7 @@ class Sim(object):
             metaAtomSpacing: Distance between meta-atoms in same layer (meters)
             metaAtomArea: Area of each meta-atom (dx * dy) (meters^2)
             wavelength: Operating wavelength (lambda) (meters)
+            device: Computation device ('cpu', 'cuda', 'mps')
         """
         self.layers = layers
         self.metaAtoms = metaAtoms
@@ -75,7 +117,8 @@ class Sim(object):
 
         positions = []
         for layer in range(self.layers):
-            z = layer * self.layerSpacing  # Stack in +z direction
+            # Start first layer at layerSpacing, not 0, to avoid z=0 plane with antennas
+            z = (layer + 1) * self.layerSpacing  # Stack in +z direction, starting at z > 0
             layer_positions = []
 
             # Create 2D grid
@@ -256,6 +299,38 @@ class Sim(object):
         """
         return self.Psi
     
+    def forward(self, phases: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable forward pass through SIM with given phases.
+
+        IMPORTANT: This method maintains gradient flow for optimization!
+        Unlike update_phases(), this doesn't modify internal state.
+
+        Args:
+            phases: (L, N) tensor of phase values in radians [0, 2π]
+
+        Returns:
+            Psi: (N, N) SIM propagation matrix with gradients attached
+        """
+        # Convert phases to complex exponentials (maintains gradients)
+        Theta_vectors = []
+        for layer in range(self.layers):
+            phase_exp = torch.exp(1j * phases[layer, :])  # (N,)
+            Theta_vectors.append(phase_exp)
+
+        # Compute Psi maintaining gradient flow
+        Psi = self.W[0] * Theta_vectors[0][None, :]  # (N, N) * (1, N) = (N, N)
+
+        # Continue through remaining layers
+        for layer in range(1, self.layers):
+            Psi = Theta_vectors[layer][:, None] * Psi  # (N, 1) * (N, N) = (N, N)
+
+            # If not last layer, multiply by next W matrix
+            if layer < self.layers - 1:
+                Psi = self.W[layer] @ Psi  # (N, N) @ (N, N) = (N, N)
+
+        return Psi  # (N, N) with gradients attached!
+
     def values(self) -> torch.Tensor:
         """
         Return current phase values.

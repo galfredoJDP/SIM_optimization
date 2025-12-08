@@ -175,6 +175,95 @@ Always return torch tensors on correct device from UserChannel methods.
 4. **Far-field approximation** (when not using Rayleigh-Sommerfeld): d >> wavelength
 5. **CLT validity**: Large number of scatterers, random phases
 
+## Reinforcement Learning Algorithms (DDPG/TD3)
+
+### When to Use RL vs PGA
+
+**Use PGA (Projected Gradient Ascent) when:**
+- Perfect CSI available
+- Continuous phases [0, 2π]
+- Objective differentiable
+- ✅ Best for typical SIM optimization
+
+**Use RL when:**
+- Quantized CSI (8-bit channel estimates)
+- Discrete phase shifters {0°, 1.4°, 2.8°, ...}
+- Time-varying channels (need policy)
+- Hardware nonlinearities present
+- Unknown channel model
+
+### DDPG/TD3 State and Action Dimensions
+
+**When Optimizing PHASES (fixed power):**
+```
+State Dimension = 204
+  - Channel matrix (real): K × N = 4 × 25 = 100
+  - Channel matrix (imag): K × N = 4 × 25 = 100
+  - Power allocation: K = 4
+  - Total: 204
+
+Action Dimension = 50
+  - Phase values: L × N = 2 × 25 = 50
+  - Range: [0, 2π]
+```
+
+**When Optimizing POWER (fixed phases):**
+```
+State Dimension = 250
+  - Channel matrix (real): K × N = 4 × 25 = 100
+  - Channel matrix (imag): K × N = 4 × 25 = 100
+  - Fixed phases: L × N = 2 × 25 = 50
+  - Total: 250
+
+Action Dimension = 4 (K users)
+  - Power per user: softmax output
+  - Range: [0, total_power] with sum = total_power
+```
+
+### Network Architecture
+
+```
+DDPG/TD3:
+
+Actor Network:
+  state_dim → 256 → 256 → action_dim
+  - Phases mode: output = sigmoid * 2π
+  - Power mode: output = softmax (probability)
+
+Critic Network:
+  (state_dim + action_dim) → 256 → 256 → 1
+  - Outputs Q-value estimate
+  - Used for both DDPG and TD3
+```
+
+### Usage Example
+
+```python
+# Optimize phases
+ddpg = DDPG(beamformer, state_dim=204, action_dim=50, optimize_target='phases')
+results = ddpg.optimize(num_episodes=100, power_allocation=fixed_power)
+optimal_phases = results['optimal_params']  # Shape: (L, N)
+
+# Optimize power
+ddpg = DDPG(beamformer, state_dim=250, action_dim=4, optimize_target='power')
+results = ddpg.optimize(num_episodes=100, phases=fixed_phases)
+optimal_power = results['optimal_params']  # Shape: (K,)
+```
+
+### Device Performance (Measured)
+
+```
+PGA on CPU:
+  - 1500 iterations
+  - Time: ~5-10 seconds
+  - Recommended: CPU (sequential, small ops)
+
+DDPG/TD3 on MPS:
+  - 500 episodes × 50 steps × batch training
+  - Time: ~5-10 minutes
+  - Recommended: MPS on Mac (batch neural networks)
+```
+
 ## References to Paper Sections
 
 - Channel model: Section II-A

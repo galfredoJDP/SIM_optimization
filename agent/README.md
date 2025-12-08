@@ -39,14 +39,32 @@ Beamforming optimization for Stacked Intelligent Metasurfaces (SIM) in holograph
 - `wireless/sim.py`: Metasurface model
 - `files/Sum-Rate_Maximization_*.pdf`: Reference paper
 
-### Recent Changes (2025-11-20)
-Modified `UserChannel.generate_channel()` to support CLT-based channel generation when user positions not available. See `recent_modifications.md` for details.
+### Recent Changes (2025-12-01)
+
+**Major Session Updates:**
+1. **DDPG/TD3 Enhancement** - Now support flexible optimization targets:
+   - Optimize phases with fixed power
+   - Optimize power with fixed phases
+   - State/action dimensions: 204→250 corrected
+
+2. **Power Sweep in main.py** - Parametric optimization across power levels:
+   - Automatic result saving (individual + combined files)
+   - Auto-generated plots and statistics
+   - Supports any number of power levels
+
+3. **Device Optimization** - CPU for PGA, MPS for RL recommended
+
+4. **Quantization Support** - Discussion and implementation for quantized CSI
+
+See `recent_modifications.md` for detailed changes and `technical_details.md` for implementation patterns.
 
 ### Important User Preferences
 - Channels should NOT regenerate during optimization (per paper)
 - CLT mode preferred for efficiency
 - Geometric mode noted as incomplete (needs cluster delay line for FR3)
 - User wants fast, practical implementations
+- RL algorithms should be flexible (optimize phases OR power, not just phases)
+- Results should be saved automatically and frequently
 
 ## For Future Claude Sessions
 

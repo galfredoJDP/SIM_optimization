@@ -16,6 +16,51 @@ class Beamformer(Transceiver, UserChannel):
 
     Architecture:
         Antennas → [A] → SIM [Ψ(phases)] → [H] → Users
+
+    Available Attributes (via self):
+        # From Transceiver:
+        .Nx (int): Number of antennas in x-direction
+        .Ny (int): Number of antennas in y-direction
+        .num_antennas (int): Total antennas M = Nx * Ny
+        .wavelength (float): Operating wavelength in meters
+        .device (str): Computation device ('cpu', 'cuda', 'mps')
+        .get_positions() -> torch.Tensor: Returns antenna positions (M, 3)
+        .compute_zf_weights(H) -> torch.Tensor: Zero-forcing weights (M, K)
+        .compute_mrt_weights(H) -> torch.Tensor: MRT weights (M, K)
+        .compute_sinr_downlink(phases, power, digital_weights) -> torch.Tensor: SINR per user (K,)
+
+        # From UserChannel:
+        .num_users (int): Number of users K
+        .user_positions (np.ndarray): User positions (K, 3) if provided
+        .reference_distance (float): Reference distance for path loss
+        .path_loss_at_reference (float): Path loss at reference in dB
+        .generate_channel(positions, time) -> torch.Tensor: Channel matrix (K, M)
+
+        # Beamformer-specific:
+        .sim_model (Sim): SIM metasurface object (if provided)
+        .noise_power (float): Noise power σ² in Watts
+        .total_power (float): Total transmit power budget in Watts
+        .H (torch.Tensor): Channel from SIM last layer to users (K, N) or antennas to users (K, M)
+        .A (torch.Tensor): Channel from antennas to SIM first layer (N, M) [only if sim_model provided]
+
+    Available Methods:
+        .compute_end_to_end_channel(phases, direction='down') -> torch.Tensor:
+            Computes H_eff = H @ Ψ @ A (K, M) for downlink
+            Args: phases (L, N), direction ('down' or 'up')
+            Returns: Effective channel (K, M) for downlink or (M, K) for uplink
+
+        .compute_sum_rate(phases, power_allocation, digital_beamforming_weights=None) -> torch.Tensor:
+            Computes sum-rate Σ log₂(1 + SINR_k) in bits/s/Hz
+            Args: phases (L, N) or None, power (K,), weights (M, K) or None
+            Returns: Scalar sum-rate
+
+        .compute_sinr(phases, power_allocation, digital_beamforming_weights=None) -> torch.Tensor:
+            Computes SINR per user
+            Args: phases (L, N) or None, power (K,), weights (M, K) or None
+            Returns: SINR per user (K,)
+
+        .update_user_channel(time=0.0):
+            Regenerates user channel H for time-varying scenarios
     """
 
     def __init__(self,

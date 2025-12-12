@@ -468,3 +468,28 @@ class Sim(object):
             print(f"  Centered: ({positions[:, 0].mean():.2e}, {positions[:, 1].mean():.2e}) m")
 
         print("=" * 60)
+
+    def to_device(self, device: str):
+        """
+        Move all SIM tensors to specified device.
+
+        Args:
+            device: Target device ('cpu', 'cuda', 'mps')
+        """
+        self.device = device
+
+        # Move meta-atom positions
+        if hasattr(self, 'metaAtomPositions') and self.metaAtomPositions is not None:
+            self.metaAtomPositions = [pos.to(device) for pos in self.metaAtomPositions]
+
+        # Move propagation matrices W
+        if hasattr(self, 'W') and self.W is not None:
+            self.W = [w.to(device) for w in self.W]
+
+        # Move transfer function Psi
+        if hasattr(self, 'Psi') and self.Psi is not None:
+            self.Psi = self.Psi.to(device)
+
+        # Move phase responses Theta
+        if hasattr(self, 'Theta') and self.Theta is not None:
+            self.Theta = [t.to(device) for t in self.Theta]

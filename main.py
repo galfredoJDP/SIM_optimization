@@ -14,14 +14,11 @@ from simpy.beamformer import Beamformer
 from simpy.algorithm import ProjectedGradientAscent as PGA, WaterFilling, DDPG, TD3
 from datetime import datetime
 import os, copy
-
+from train import load_weights
 
 # Set random seed for reproducibility
 np.random.seed(35)
 torch.manual_seed(35)
-
-
-
 
 # ========== Visualization Functions ==========
 
@@ -192,6 +189,9 @@ if __name__ == "__main__":
     results_dir = f"results/run_{timestamp}"
     os.makedirs(results_dir, exist_ok=True)
 
+    ddpg_flag = False
+    td3_flag = False
+
     # System parameters
     num_users = 4
     wavelength = 0.125  # meters
@@ -252,9 +252,7 @@ if __name__ == "__main__":
     )
 
     sim_beamformer_ddpg = copy.deepcopy(sim_beamformer)
-    sim_beamformer_ddpg.device = 'mps'
     sim_beamformer_td3 = copy.deepcopy(sim_beamformer_ddpg)
-    sim_beamformer_td3.device = 'mps'
 
     digital_beamformer = Beamformer(
         Nx=2,  # 2x2 = 4 antennas to match K=4 users
@@ -279,7 +277,7 @@ if __name__ == "__main__":
     """
     Power sweep configuration
     """
-    power_values_db = np.array([26])  # dBm values to sweep
+    power_values_db = np.array([10, 15, 20, 25, 30])  # dBm values to sweep
     # power_values_db = np.array([ 7, 12, 17, 22, 27, 32])  # dBm values to sweep
     power_values_linear = 10**(power_values_db/10) / 1000  # Convert to Watts
 
@@ -304,8 +302,10 @@ if __name__ == "__main__":
 
         # Update beamformer with new power
         sim_beamformer.total_power = power_w
-        sim_beamformer_ddpg.total_power = power_w
-        sim_beamformer_td3.total_power = power_w
+        if ddpg_flag:
+            sim_beamformer_ddpg.total_power = power_w
+        if td3_flag:
+            sim_beamformer_td3.total_power = power_w
         digital_beamformer.total_power = power_w
 
         # Run optimization multiple times at this power level
@@ -330,8 +330,16 @@ if __name__ == "__main__":
 
             # Regenerate channels for this run (new channel realization)
             sim_beamformer.update_user_channel(time=float(i))
-            sim_beamformer_td3.H = sim_beamformer.H.clone()
-            sim_beamformer_ddpg.H = sim_beamformer.H.clone()
+            if ddpg_flag: 
+                sim_beamformer_ddpg.H = sim_beamformer.H.clone()
+            if td3_flag: 
+                sim_beamformer_td3.H = sim_beamformer.H.clone()
+
+            # Move all beamformer tensors to MPS for DDPG/TD3
+            if ddpg_flag: 
+                sim_beamformer_ddpg.to_device('mps')
+            if td3_flag: 
+                sim_beamformer_td3.to_device('mps')
 
             power_allocation = torch.ones(num_users, device=device) * (power_w / num_users)
             sim_phases = torch.rand(sim_layers, sim_metaatoms, device=device) * 2 * np.pi
@@ -353,49 +361,74 @@ if __name__ == "__main__":
             sumrate_after_waterfilling = wf_results['optimal_sum_rate']
 
             all_results[f'{power_db:.1f}dBm']['reference'].append(sumrate_after_waterfilling)
-        
+
+            # Initial conditions (shared starting point)
+            initial_phases = sim_phases.clone()
+            initial_power = torch.ones(num_users, device=device) * (power_w / num_users)
+
+            # Independent state for each algorithm
+            phases_pga = initial_phases.clone()
+            if ddpg_flag: 
+                phases_ddpg = initial_phases.clone().to('mps')
+            if td3_flag: 
+                phases_td3 = initial_phases.clone().to('mps')
+
+            power_pga = initial_power.clone()
+            if ddpg_flag: 
+                power_ddpg = initial_power.clone().to('mps')
+            if td3_flag: 
+                power_td3 = initial_power.clone().to('mps')
+
+            # Track results for each path
+            results_pga = {'sumrates': [], 'final_phases': None, 'final_power': None}
+            if ddpg_flag: 
+                results_ddpg = {'sumrates': [], 'final_phases': None, 'final_power': None}
+            if td3_flag: 
+                results_td3 = {'sumrates': [], 'final_phases': None, 'final_power': None}
+            
+            if ddpg_flag:
+                optimizer_ddpg = DDPG(
+                        beamformer=sim_beamformer_ddpg,
+                        state_dim=2 * num_users * sim_metaatoms + num_users + (sim_layers * sim_metaatoms),
+                        action_dim=sim_layers * sim_metaatoms,
+                        verbose=False,
+                        device = 'mps',
+                        noise_std=1,
+                        tau=0.01,
+                        actor_lr=0.01,
+                        critic_lr=0.01
+                    )
+                load_weights(agent=optimizer_ddpg, checkpoint_path='weights/ddpg_latest.pth', device='mps' )
+            if td3_flag:
+                optimizer_td3 = TD3(
+                        beamformer=sim_beamformer_td3,
+                        state_dim=2 * num_users * sim_metaatoms + num_users + (sim_layers * sim_metaatoms),
+                        action_dim=sim_layers * sim_metaatoms,
+                        verbose=False,
+                        device='mps'
+                    )
+                load_weights(agent = optimizer_td3,checkpoint_path='weights/td3_latest.pth', device='mps' )
+            
             for j in range(alternative_iterations):
                 '''
-                PGA Phase for SIM
+                PATH 1: PGA + Waterfilling
                 '''
-                optimizer = PGA(
+                print("Starting PGA")
+                optimizer_pga = PGA(
                     beamformer=sim_beamformer,
-                    objective_fn=lambda phases: sim_beamformer.compute_sum_rate(phases=phases, power_allocation=power_allocation),
+                    objective_fn=lambda phases: sim_beamformer.compute_sum_rate(phases=phases, power_allocation=power_pga),
                     learning_rate=0.1,
                     max_iterations=5000,
                     verbose=False,
                     use_backtracking=True,
                     backtrack_max_iter=1000
-                )       
-                results = optimizer.optimize(sim_phases) 
-
-                '''
-                DDPG Phase for SIM 
-                '''
-                optimizer = DDPG(
-                    beamformer=sim_beamformer,
-                    state_dim=2 * num_users * sim_metaatoms + num_users,
-                    action_dim= sim_layers * sim_metaatoms
                 )
-                results = optimizer.optimize(
-                    num_episodes=100,
-                    steps_per_episode=20,
-                    power_allocation=power_allocation
-                )
+                pga_result = optimizer_pga.optimize(phases_pga)
+                phases_pga = pga_result['optimal_params']
 
-
-                optimal_phases = results['optimal_params']
-                sumrate_after_phase_opt = results['optimal_objective']
-
-                # Step 2: Apply waterfilling for power allocation with fixed optimal phases
-                H_eff = sim_beamformer.compute_end_to_end_channel(optimal_phases)
-
-                # #apply digital beamforming to SIM here
-                # zf_weights_sim = sim_beamformer.compute_zf_weights(H_eff)
-                # H_eff_sim_digital = H_eff @ zf_weights_sim
-
-                waterfilling = WaterFilling(
-                    H_eff=H_eff,
+                H_eff_pga = sim_beamformer.compute_end_to_end_channel(phases_pga)
+                wf_pga = WaterFilling(
+                    H_eff=H_eff_pga,
                     noise_power=sim_beamformer.noise_power,
                     total_power=power_w,
                     max_iterations=200,
@@ -403,43 +436,130 @@ if __name__ == "__main__":
                     verbose=False,
                     device=device
                 )
+                wf_pga_result = wf_pga.optimize(initial_power=power_pga)
+                power_pga = wf_pga_result['optimal_power']
+                sumrate_pga = wf_pga_result['optimal_sum_rate']
+                results_pga['sumrates'].append(sumrate_pga)
 
-                wf_results = waterfilling.optimize(
-                    initial_power = power_allocation
-                )
-                optimal_power = wf_results['optimal_power']
-                sumrate_after_waterfilling = wf_results['optimal_sum_rate']
+                '''
+                 PATH 2: DDPG + Waterfilling
+               '''
+                if ddpg_flag:
+                    print("Starting DDPG")
+                    ddpg_result = optimizer_ddpg.optimize_with_policy(
+                        initial_phases=phases_ddpg,  # Start from current DDPG state
+                        power_allocation=power_ddpg,
+                        num_iterations=5000,
+                        early_stopping_patience=100
+                    )
+                
+                    phases_ddpg = ddpg_result['optimal_params']
 
-                # Store results with both phase-only and phase+waterfilling sum-rates
-                sumrate.append(sumrate_after_waterfilling)
+                    H_eff_ddpg = sim_beamformer.compute_end_to_end_channel(phases_ddpg.to(device))
+                    wf_ddpg = WaterFilling(
+                        H_eff=H_eff_ddpg,
+                        noise_power=sim_beamformer.noise_power,
+                        total_power=power_w,
+                        max_iterations=200,
+                        tolerance=1e-6,
+                        verbose=False,
+                        device=device
+                    )
+                    wf_ddpg_result = wf_ddpg.optimize(initial_power=power_ddpg.to(device))
+                    power_ddpg = wf_ddpg_result['optimal_power'].to('mps')
+                    sumrate_ddpg = wf_ddpg_result['optimal_sum_rate']
+                    results_ddpg['sumrates'].append(sumrate_ddpg)
 
-                # Detach and clear computational graph for next iteration
-                power_allocation = optimal_power.detach().clone()
-                sim_phases = optimal_phases.detach().clone()
+                '''
+                PATH 3: TD3 + Waterfilling
+                '''
+                if td3_flag:
+                    print("Starting TD3")
+                    td3_result = optimizer_td3.optimize_with_policy(
+                        initial_phases=phases_td3,  # Start from current TD3 state
+                        power_allocation=power_td3,
+                        num_iterations=5000,
+                        early_stopping_patience=100
+                    )
+                    phases_td3 = td3_result['optimal_params']
 
-                # Clear memory cache based on device
+                    H_eff_td3 = sim_beamformer.compute_end_to_end_channel(phases_td3.to(device))
+                    wf_td3 = WaterFilling(
+                        H_eff=H_eff_td3,
+                        noise_power=sim_beamformer.noise_power,
+                        total_power=power_w,
+                        max_iterations=200,
+                        tolerance=1e-6,
+                        verbose=False,
+                        device=device
+                    )
+                    wf_td3_result = wf_td3.optimize(initial_power=power_td3.to(device))
+                    power_td3 = wf_td3_result['optimal_power'].to('mps')
+                    sumrate_td3 = wf_td3_result['optimal_sum_rate']
+                    results_td3['sumrates'].append(sumrate_td3)
+
+                # Clear memory cache
                 if device == 'cuda':
                     torch.cuda.empty_cache()
-                elif device == 'mps':
-                    torch.mps.empty_cache()
-                # For CPU, PyTorch automatically manages memory
+                torch.mps.empty_cache()
 
-                # Update results dict with power and sum-rates
-                results['optimal_power'] = optimal_power
-                results['sumrate_phase_only'] = sumrate_after_phase_opt
-                results['sumrate_with_waterfilling'] = sumrate_after_waterfilling
+                # Print results
+                print_str = f"Alt iter {j} | PGA: {sumrate_pga:.4f}"
+                if ddpg_flag:
+                    print_str += f" | DDPG: {sumrate_ddpg:.4f}"
+                if td3_flag:
+                    print_str += f" | TD3: {sumrate_td3:.4f}"
+                print(print_str)
 
-                print(f"PGA : {sumrate_after_phase_opt} | WF : {sumrate_after_waterfilling}")
-                
-                # Add WF diagnostics and store
-                all_results[f'{power_db:.1f}dBm']['results'].append({
-                    **results,  # PGA results
-                    'wf_sinr': wf_results['sinr_per_user'],
-                    'wf_snr': wf_results['snr_per_user'],
-                    'wf_rate_per_user': wf_results['rate_per_user'],
-                    'wf_power_per_user': wf_results['power_per_user']
-                })
-                all_results[f'{power_db:.1f}dBm']['sumrate'].append(sumrate_after_waterfilling)
+            # Store final results for this channel realization
+            results_pga['final_phases'] = phases_pga
+            results_pga['final_power'] = power_pga
+            if ddpg_flag:
+                results_ddpg['final_phases'] = phases_ddpg
+                results_ddpg['final_power'] = power_ddpg
+            if td3_flag:
+                results_td3['final_phases'] = phases_td3
+                results_td3['final_power'] = power_td3
+
+            # Store the final sum-rate after all alternating iterations
+            sumrate_entry = {'pga': results_pga['sumrates'][-1]}
+            if ddpg_flag:
+                sumrate_entry['ddpg'] = results_ddpg['sumrates'][-1]
+            if td3_flag:
+                sumrate_entry['td3'] = results_td3['sumrates'][-1]
+            sumrate.append(sumrate_entry)
+
+            # Store detailed results
+            detailed_entry = {
+                'pga': {
+                    'sumrates_over_iterations': results_pga['sumrates'],
+                    'final_sumrate': results_pga['sumrates'][-1],
+                    'wf_sinr': wf_pga_result['sinr_per_user'],
+                    'wf_rate_per_user': wf_pga_result['rate_per_user'],
+                }
+            }
+            if ddpg_flag:
+                detailed_entry['ddpg'] = {
+                    'sumrates_over_iterations': results_ddpg['sumrates'],
+                    'final_sumrate': results_ddpg['sumrates'][-1],
+                    'wf_sinr': wf_ddpg_result['sinr_per_user'],
+                    'wf_rate_per_user': wf_ddpg_result['rate_per_user'],
+                }
+            if td3_flag:
+                detailed_entry['td3'] = {
+                    'sumrates_over_iterations': results_td3['sumrates'],
+                    'final_sumrate': results_td3['sumrates'][-1],
+                    'wf_sinr': wf_td3_result['sinr_per_user'],
+                    'wf_rate_per_user': wf_td3_result['rate_per_user'],
+                }
+            all_results[f'{power_db:.1f}dBm']['results'].append(detailed_entry)
+
+            sumrate_simple = {'pga': results_pga['sumrates'][-1]}
+            if ddpg_flag:
+                sumrate_simple['ddpg'] = results_ddpg['sumrates'][-1]
+            if td3_flag:
+                sumrate_simple['td3'] = results_td3['sumrates'][-1]
+            all_results[f'{power_db:.1f}dBm']['sumrate'].append(sumrate_simple)
             
 
                 
@@ -452,59 +572,104 @@ if __name__ == "__main__":
 
 
     #%%
-    # Plot results across all power levels
+    # Plot results comparing PGA, DDPG, TD3
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Plot 1: Scatter plot for each power level
+    # Plot 1: Scatter plot comparing all algorithms
     ax = axes[0]
-    colors = plt.cm.viridis(np.linspace(0, 1, len(sumrate_all_powers)))
-    for (power_db, sumrates), color in zip(sumrate_all_powers.items(), colors):
-        ax.scatter(range(len(sumrates)), sumrates, label=f'{power_db}', alpha=0.7, s=50, color=color)
-    ax.set_xlabel('Run Number')
+    power_labels = list(sumrate_all_powers.keys())
+    for power_db in power_labels:
+        sumrates = sumrate_all_powers[power_db]
+        pga_rates = [s['pga'] for s in sumrates]
+        x = range(len(pga_rates))
+        ax.scatter(x, pga_rates, label=f'PGA ({power_db})', alpha=0.7, s=50, marker='o')
+        if ddpg_flag:
+            ddpg_rates = [s['ddpg'] for s in sumrates]
+            ax.scatter(x, ddpg_rates, label=f'DDPG ({power_db})', alpha=0.7, s=50, marker='s')
+        if td3_flag:
+            td3_rates = [s['td3'] for s in sumrates]
+            ax.scatter(x, td3_rates, label=f'TD3 ({power_db})', alpha=0.7, s=50, marker='^')
+    ax.set_xlabel('Iteration')
     ax.set_ylabel('Sum-Rate (bits/s/Hz)')
-    ax.set_title('Sum-Rate across Power Sweep')
+    # Dynamic title based on enabled algorithms
+    title_parts = ['PGA']
+    if ddpg_flag:
+        title_parts.append('DDPG')
+    if td3_flag:
+        title_parts.append('TD3')
+    ax.set_title(' vs '.join(title_parts) + ' Sum-Rate Comparison')
+    ax.legend(loc='best', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # Plot 2: Mean comparison bar chart
+    ax = axes[1]
+    num_algorithms = 1 + (1 if ddpg_flag else 0) + (1 if td3_flag else 0) + 1  # PGA + DDPG? + TD3? + ZF
+    x = np.arange(len(power_labels))
+    width = 0.2
+
+    for i, power_db in enumerate(power_labels):
+        sumrates = sumrate_all_powers[power_db]
+        pga_mean = np.mean([s['pga'] for s in sumrates])
+        ref_mean = np.mean(all_results[power_db]['reference'])
+
+        bar_position = 0
+        ax.bar(i - (num_algorithms-1)*width/2 + bar_position*width, pga_mean, width,
+               label='PGA' if i == 0 else '', color='blue', alpha=0.7)
+        bar_position += 1
+
+        if ddpg_flag:
+            ddpg_mean = np.mean([s['ddpg'] for s in sumrates])
+            ax.bar(i - (num_algorithms-1)*width/2 + bar_position*width, ddpg_mean, width,
+                   label='DDPG' if i == 0 else '', color='green', alpha=0.7)
+            bar_position += 1
+
+        if td3_flag:
+            td3_mean = np.mean([s['td3'] for s in sumrates])
+            ax.bar(i - (num_algorithms-1)*width/2 + bar_position*width, td3_mean, width,
+                   label='TD3' if i == 0 else '', color='orange', alpha=0.7)
+            bar_position += 1
+
+        ax.bar(i - (num_algorithms-1)*width/2 + bar_position*width, ref_mean, width,
+               label='ZF (ref)' if i == 0 else '', color='red', alpha=0.7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(power_labels)
+    ax.set_ylabel('Mean Sum-Rate (bits/s/Hz)')
+    ax.set_xlabel('Transmit Power')
+    ax.set_title('Mean Performance: PGA vs DDPG vs TD3')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Plot 2: Mean and std across power levels
-    ax = axes[1]
-    power_labels = list(sumrate_all_powers.keys())
-    means = [np.mean(sumrate_all_powers[p]) for p in power_labels]
-    stds = [np.std(sumrate_all_powers[p]) for p in power_labels]
-    ax.errorbar(range(len(power_labels)), means, yerr=stds, marker='o', capsize=5, linewidth=2, markersize=8)
-    ax.set_xticks(range(len(power_labels)))
-    ax.set_xticklabels(power_labels, rotation=0)
-    ax.set_ylabel('Mean Sum-Rate (bits/s/Hz)')
-    ax.set_xlabel('Transmit Power')
-    ax.set_title('Mean Performance vs Transmit Power')
-    ax.grid(True, alpha=0.3)
-
     plt.tight_layout()
-    plot_file = os.path.join(results_dir, 'WF_PGA.png')
+    plot_file = os.path.join(results_dir, 'PGA_DDPG_TD3_comparison.png')
     plt.savefig(plot_file, dpi=150, bbox_inches='tight')
     print(f"\n✓ Plot saved: {plot_file}")
 
-
-
     #%%
-    #plot 3: something more similar to the paper 
-    plt.figure()
+    # Plot paper-style comparison
+    plt.figure(figsize=(10, 6))
     power_labels = list(sumrate_all_powers.keys())
-    means = [np.mean(sumrate_all_powers[p]) for p in power_labels]
-    plt.plot(power_values_db, means, 'bo-', markersize=8)
 
+    # Extract means for each algorithm
+    pga_means = [np.mean([s['pga'] for s in sumrate_all_powers[p]]) for p in power_labels]
+    ddpg_means = [np.mean([s['ddpg'] for s in sumrate_all_powers[p]]) for p in power_labels]
+    td3_means = [np.mean([s['td3'] for s in sumrate_all_powers[p]]) for p in power_labels]
     reference_means = [np.mean(all_results[p]['reference']) for p in power_labels]
-    plt.plot(power_values_db, reference_means, 'ro-', markersize=8)
-    plt.legend(["WF : PGA", "WF : ZF"])
-    plt.ylim(0, 25)
-    plt.xlim(10, 35)
-    plt.grid()
-    plt.xlabel('Transmit Power (dBm)')
-    plt.ylabel('Mean Sum-Rate (bits/s/Hz)')
-    plt.title('Mean Sum-Rate vs Transmit Power')
-    plot_file = os.path.join(results_dir, 'WF_PGA_mean.png')
 
+    plt.plot(power_values_db, pga_means, 'bo-', markersize=8, linewidth=2, label='WF + PGA')
+    plt.plot(power_values_db, ddpg_means, 'gs-', markersize=8, linewidth=2, label='WF + DDPG')
+    plt.plot(power_values_db, td3_means, 'm^-', markersize=8, linewidth=2, label='WF + TD3')
+    plt.plot(power_values_db, reference_means, 'ro--', markersize=8, linewidth=2, label='WF + ZF (reference)')
+
+    plt.legend(fontsize=10)
+    plt.ylim(0, 25)
+    plt.grid(True, alpha=0.3)
+    plt.xlabel('Transmit Power (dBm)', fontsize=12)
+    plt.ylabel('Mean Sum-Rate (bits/s/Hz)', fontsize=12)
+    plt.title('Sum-Rate vs Transmit Power: Algorithm Comparison', fontsize=14)
+    plot_file = os.path.join(results_dir, 'algorithm_comparison.png')
     plt.savefig(plot_file, dpi=150, bbox_inches='tight')
+    print(f"✓ Plot saved: {plot_file}")
 
 
 
@@ -517,156 +682,95 @@ if __name__ == "__main__":
     print("SUMMARY STATISTICS")
     print(f"{'='*80}")
     for power_db, sumrates in sumrate_all_powers.items():
+        pga_rates = [s['pga'] for s in sumrates]
+        ddpg_rates = [s['ddpg'] for s in sumrates]
+        td3_rates = [s['td3'] for s in sumrates]
         print(f"\nPower: {power_db}")
-        print(f"  Mean:   {np.mean(sumrates):.4f} bits/s/Hz")
-        print(f"  Std:    {np.std(sumrates):.4f} bits/s/Hz")
-        print(f"  Min:    {np.min(sumrates):.4f} bits/s/Hz")
-        print(f"  Max:    {np.max(sumrates):.4f} bits/s/Hz")
+        print(f"  PGA:  Mean={np.mean(pga_rates):.4f}, Std={np.std(pga_rates):.4f}")
+        print(f"  DDPG: Mean={np.mean(ddpg_rates):.4f}, Std={np.std(ddpg_rates):.4f}")
+        print(f"  TD3:  Mean={np.mean(td3_rates):.4f}, Std={np.std(td3_rates):.4f}")
 
-    #%% Plot per-user diagnostics
+    #%% Plot per-user diagnostics (comparing algorithms)
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # SINR distribution across runs
+    # SINR comparison for PGA vs DDPG vs TD3
     ax = axes[0, 0]
     for power_db in power_labels:
-        sinr_data = [r['wf_sinr'] for r in all_results[power_db]['results']]
-        sinr_mean = np.mean(sinr_data, axis=0)  # Mean per user
-        ax.plot(range(num_users), 10*np.log10(sinr_mean), 'o-', label=power_db)
+        pga_sinr = [r['pga']['wf_sinr'] for r in all_results[power_db]['results']]
+        ddpg_sinr = [r['ddpg']['wf_sinr'] for r in all_results[power_db]['results']]
+        td3_sinr = [r['td3']['wf_sinr'] for r in all_results[power_db]['results']]
+        pga_mean = np.mean(pga_sinr, axis=0)
+        ddpg_mean = np.mean(ddpg_sinr, axis=0)
+        td3_mean = np.mean(td3_sinr, axis=0)
+        ax.plot(range(num_users), 10*np.log10(pga_mean), 'o-', label=f'PGA ({power_db})')
+        ax.plot(range(num_users), 10*np.log10(ddpg_mean), 's--', label=f'DDPG ({power_db})')
+        ax.plot(range(num_users), 10*np.log10(td3_mean), '^:', label=f'TD3 ({power_db})')
     ax.set_xlabel('User Index')
     ax.set_ylabel('Mean SINR (dB)')
-    ax.set_title('SINR per User vs Power Level')
-    ax.legend()
+    ax.set_title('SINR per User: PGA vs DDPG vs TD3')
+    ax.legend(fontsize=7)
     ax.grid(True)
 
-    # SNR vs SINR comparison
+    # Rate per user comparison
     ax = axes[0, 1]
-    power_db = power_labels[-1]  # Highest power
-    sinr_data = np.mean([r['wf_sinr'] for r in all_results[power_db]['results']], axis=0)
-    snr_data = np.mean([r['wf_snr'] for r in all_results[power_db]['results']], axis=0)
-    x = np.arange(num_users)
-    ax.bar(x - 0.2, 10*np.log10(snr_data), 0.4, label='SNR (no interference)')
-    ax.bar(x + 0.2, 10*np.log10(sinr_data), 0.4, label='SINR (with interference)')
-    ax.set_xlabel('User Index')
-    ax.set_ylabel('dB')
-    ax.set_title(f'SNR vs SINR at {power_db}')
-    ax.legend()
-    ax.grid(True)
-
-    # Rate per user
-    ax = axes[1, 0]
     for power_db in power_labels:
-        rate_data = [r['wf_rate_per_user'] for r in all_results[power_db]['results']]
-        rate_mean = np.mean(rate_data, axis=0)
-        ax.plot(range(num_users), rate_mean, 'o-', label=power_db)
+        pga_rate = [r['pga']['wf_rate_per_user'] for r in all_results[power_db]['results']]
+        ddpg_rate = [r['ddpg']['wf_rate_per_user'] for r in all_results[power_db]['results']]
+        td3_rate = [r['td3']['wf_rate_per_user'] for r in all_results[power_db]['results']]
+        pga_mean = np.mean(pga_rate, axis=0)
+        ddpg_mean = np.mean(ddpg_rate, axis=0)
+        td3_mean = np.mean(td3_rate, axis=0)
+        ax.plot(range(num_users), pga_mean, 'o-', label=f'PGA ({power_db})')
+        ax.plot(range(num_users), ddpg_mean, 's--', label=f'DDPG ({power_db})')
+        ax.plot(range(num_users), td3_mean, '^:', label=f'TD3 ({power_db})')
     ax.set_xlabel('User Index')
     ax.set_ylabel('Rate (bits/s/Hz)')
-    ax.set_title('Rate per User vs Power Level')
-    ax.legend()
+    ax.set_title('Rate per User: PGA vs DDPG vs TD3')
+    ax.legend(fontsize=7)
     ax.grid(True)
 
-    # Power allocation per user
+    # Sum-rate distribution boxplot
+    ax = axes[1, 0]
+    for i, power_db in enumerate(power_labels):
+        sumrates = sumrate_all_powers[power_db]
+        pga_rates = [s['pga'] for s in sumrates]
+        ddpg_rates = [s['ddpg'] for s in sumrates]
+        td3_rates = [s['td3'] for s in sumrates]
+        positions = [i*4, i*4+1, i*4+2]
+        bp = ax.boxplot([pga_rates, ddpg_rates, td3_rates], positions=positions, widths=0.6)
+    ax.set_xlabel('Algorithm')
+    ax.set_ylabel('Sum-Rate (bits/s/Hz)')
+    ax.set_title('Sum-Rate Distribution by Algorithm')
+    ax.set_xticks([0, 1, 2])
+    ax.set_xticklabels(['PGA', 'DDPG', 'TD3'])
+    ax.grid(True, alpha=0.3)
+
+    # Improvement over PGA
     ax = axes[1, 1]
     for power_db in power_labels:
-        power_data = [r['wf_power_per_user'] for r in all_results[power_db]['results']]
-        power_mean = np.mean(power_data, axis=0)
-        ax.plot(range(num_users), power_mean, 'o-', label=power_db)
-    ax.set_xlabel('User Index')
-    ax.set_ylabel('Power (W)')
-    ax.set_title('Power Allocation per User')
+        sumrates = sumrate_all_powers[power_db]
+        pga_rates = np.array([s['pga'] for s in sumrates])
+        ddpg_rates = np.array([s['ddpg'] for s in sumrates])
+        td3_rates = np.array([s['td3'] for s in sumrates])
+        ddpg_improvement = (ddpg_rates - pga_rates) / pga_rates * 100
+        td3_improvement = (td3_rates - pga_rates) / pga_rates * 100
+        ax.bar(0, np.mean(ddpg_improvement), yerr=np.std(ddpg_improvement),
+               capsize=5, color='green', alpha=0.7, label='DDPG' if power_db == power_labels[0] else '')
+        ax.bar(1, np.mean(td3_improvement), yerr=np.std(td3_improvement),
+               capsize=5, color='orange', alpha=0.7, label='TD3' if power_db == power_labels[0] else '')
+    ax.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Algorithm')
+    ax.set_ylabel('Improvement over PGA (%)')
+    ax.set_title('RL Improvement over PGA Baseline')
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(['DDPG', 'TD3'])
     ax.legend()
-    ax.grid(True)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, 'per_user_diagnostics.png'), dpi=150)
+    print(f"✓ Plot saved: {os.path.join(results_dir, 'per_user_diagnostics.png')}")
 
-    # print("\n6. Computing SINR and Sum-Rate...")
-    # sum_rate_sim = sim_beamformer.compute_sum_rate(phases=results['optimal_params'], power_allocation=power_allocation)
-    # print(f"   Sum-Rate:  {sum_rate_sim.item():.4f} bits/s/Hz")
-
-    # print("\n7. Verifying channels used in SINR computation...")
-    # print(f"   Pre-digital-weights channel shape: {sim_beamformer.pre_digital_weights_channel.shape}")
-    # print(f"      = H @ Psi @ A (end-to-end through SIM)")
-    # print(f"   Effective channel shape: {sim_beamformer.last_effective_channel.shape}")
-    # print(f"      = Same as above (no digital weights in SIM-only case)")
-    # print(f"   Interpretation: (K={sim_beamformer.last_effective_channel.shape[0]}, M={sim_beamformer.last_effective_channel.shape[1]})")
-    # print(f"   Since M=K: H_eff[k,k] = signal, H_eff[k,j≠k] = interference")
-
-    # # ========== Case 2: Digital Beamformer (No SIM) ==========
-    # print("\n" + "="*80)
-    # print("CASE 2: DIGITAL BEAMFORMING (Traditional M > K Architecture)")
-    # print("="*80)
-
-    # print("\n1. Creating Digital Beamformer ...")
-    # digital_beamformer = Beamformer(
-    #     # Transceiver params - Using M=64 antennas for K=4 users
-    #     Nx=Nx_antenna,  # 8x8 = 64 antennas
-    #     Ny=Ny_antenna,
-    #     wavelength=wavelength,
-    #     device=device,
-    #     # Channel params (CLT mode - no user_positions)
-    #     num_users=num_users,
-    #     user_positions=None,  # Will use CLT mode
-    #     reference_distance=reference_distance,
-    #     path_loss_at_reference=path_loss_at_reference,
-    #     min_user_distance=min_user_distance,
-    #     max_user_distance=max_user_distance,
-    #     # System params
-    #     noise_power=noise_power,
-    #     total_power=total_power,
-    #     use_nearfield_user_channel=False  # Use CLT mode
-    # )
-    # print(f"   Created with M={num_antennas} antennas, K={num_users} users")
-
-    # print("\n2. Visualizing antenna array positions...")
-    # visualize_antenna_array(digital_beamformer.get_positions(),
-    #                        array_config=(Nx_antenna, Ny_antenna),
-    #                        save_path='antenna_array.png')
-
-
-    # """
-    # Digital Only Beamformer Optimization ----------------------------------------------------------------
-    # """
-    # print("\n" + "-"*80)
-    # print("3. >>> OPTIMIZATION GOES HERE <<<")
-    # print("-"*80)
-    # # Digital beamforming weights
-    # W_digital_dummy = torch.randn(num_antennas, num_users, dtype=torch.complex64, device=device)
-    # # Normalize columns to unit norm (common practice)
-    # for k in range(num_users):
-    #     W_digital_dummy[:, k] /= torch.norm(W_digital_dummy[:, k])
-    # print(f"   Digital beamforming weights W: {W_digital_dummy.shape}")
-    # print(f"   Interpretation: (M={num_antennas}, K={num_users})")
-    # print(f"   Column k = beamforming vector for user k")
-
-    # power_allocation = torch.ones(num_users, device=device) * (total_power / num_users)
-    # print(f"   Power allocation:              {power_allocation.shape} = (K={num_users},)")
-    # print("-"*80)
-    # """
-    # ------------------------------------------------------------------------------------------------------
-    # """
-    # print("\n4. Computing SINR and Sum-Rate...")
-    # sum_rate_digital = digital_beamformer.compute_sum_rate(
-    #     phases=None,  # No SIM
-    #     power_allocation=power_allocation,
-    #     digital_beamforming_weights=W_digital_dummy
-    # )
-    # print(f"   Sum-Rate:  {sum_rate_digital.item():.4f} bits/s/Hz")
-
-    # print("\n5. Verifying channels used in SINR computation...")
-    # print(f"   Pre-digital-weights channel shape: {digital_beamformer.pre_digital_weights_channel.shape}")
-    # print(f"      = H (antennas → users)")
-    # print(f"   Effective channel shape: {digital_beamformer.last_effective_channel.shape}")
-    # print(f"      = H @ W (after digital beamforming weights)")
-    # print(f"   Interpretation: (K={digital_beamformer.last_effective_channel.shape[0]}, K={digital_beamformer.last_effective_channel.shape[1]})")
-    # print(f"   H_eff[k,k] = signal for user k, H_eff[k,j≠k] = interference from beam j")
-
-    # # ========== Summary ==========
-    # print("\n" + "="*80)
-    # print("SUMMARY")
-    # print("="*80)
-    # print(f"\nSIM-based (M=K=4):    Sum-Rate = {sum_rate_sim.item():.4f} bits/s/Hz")
-    # print(f"Digital (M=64, K=4):  Sum-Rate = {sum_rate_digital.item():.4f} bits/s/Hz")
-    # print(f"\nNote: Random weights used - digital should perform better with optimized weights")
-    # print("="*80)
+    
 
     # %%

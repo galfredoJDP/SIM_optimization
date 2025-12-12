@@ -1,0 +1,90 @@
+/Users/alfredogonzalez/Desktop/code/SIM_optimization/simpy/algorithm.py:1693: UserWarning: The use of `x.T` on tensors of dimension other than 2 to reverse their shape is deprecated and it will throw an error in a future release. Consider `x.mT` to transpose batches of matrices or `x.permute(*torch.arange(x.ndim - 1, -1, -1))` to reverse the dimensions of a tensor. (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/aten/src/ATen/native/TensorShape.cpp:4419.)
+  numerator = torch.real(torch.conj(R).T * h_i * symbols[i])
+/Users/alfredogonzalez/Desktop/code/SIM_optimization/simpy/algorithm.py:1695: UserWarning: Casting complex values to real discards the imaginary part (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/aten/src/ATen/native/Copy.cpp:309.)
+  alpha[i] = torch.sum(numerator) / torch.sum(denominator)
+
+================================================================================
+TESTING 1-BIT ADMM vs CONTINUOUS USING SYMBOL ERROR RATE (SER)
+Paper: Wen et al., 'One-Bit Downlink Precoding for Massive MIMO OFDM'
+================================================================================
+
+Configuration:
+  Antennas: M=64, Users: K=8
+  Transmit power range: 0 to 9 dBm
+  Noise power: -80 dBm
+  Channel trials: 10
+  Noise trials per channel: 50
+  Modulation: QPSK
+  Lambda penalty: 1.0 (validated)
+
+Running SER simulation...
+
+  Tx Power: 0 dBm (1/10)
+    1-bit SER: 0.7500 ± 0.1369
+    Continuous SER: 0.7368 ± 0.1548
+
+  Tx Power: 1 dBm (2/10)
+    1-bit SER: 0.7000 ± 0.1500
+    Continuous SER: 0.6750 ± 0.1500
+
+  Tx Power: 2 dBm (3/10)
+    1-bit SER: 0.7250 ± 0.1225
+    Continuous SER: 0.7005 ± 0.1267
+
+  Tx Power: 3 dBm (4/10)
+    1-bit SER: 0.8000 ± 0.1146
+    Continuous SER: 0.7552 ± 0.1428
+
+  Tx Power: 4 dBm (5/10)
+    1-bit SER: 0.7853 ± 0.1557
+    Continuous SER: 0.6750 ± 0.1601
+
+  Tx Power: 5 dBm (6/10)
+    1-bit SER: 0.7125 ± 0.1375
+    Continuous SER: 0.6943 ± 0.1538
+
+  Tx Power: 6 dBm (7/10)
+    1-bit SER: 0.7250 ± 0.1346
+    Continuous SER: 0.6663 ± 0.1541
+
+  Tx Power: 7 dBm (8/10)
+    1-bit SER: 0.7875 ± 0.1772
+    Continuous SER: 0.7873 ± 0.1774
+
+  Tx Power: 8 dBm (9/10)
+    1-bit SER: 0.7448 ± 0.0981
+    Continuous SER: 0.6238 ± 0.1443
+
+  Tx Power: 9 dBm (10/10)
+    1-bit SER: 0.6875 ± 0.1505
+    Continuous SER: 0.6115 ± 0.2239
+
+================================================================================
+PLOTTING RESULTS
+================================================================================
+
+✓ Saved: test/admm_comparison/ser_vs_txpower.png
+
+================================================================================
+VALIDATION SUMMARY
+================================================================================
+
+Symbol Error Rate Results:
+Tx Power (dBm)     1-bit SER       Continuous SER 
+--------------------------------------------------
+0.0                0.7500          0.7368         
+2.0                0.7250          0.7005         
+4.0                0.7853          0.6750         
+6.0                0.7250          0.6663         
+8.0                0.7448          0.6238         
+
+================================================================================
+KEY FINDING
+================================================================================
+
+⚠ Could not compute gap at SER=0.01
+  SER range: 0.6875 to 0.8000
+  Consider adjusting power range or target SER
+
+================================================================================
+

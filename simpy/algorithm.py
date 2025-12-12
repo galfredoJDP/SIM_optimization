@@ -444,7 +444,10 @@ class WaterFilling:
                  max_iterations: int = 100,
                  tolerance: float = 1e-6,
                  verbose: bool = True,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 num_bits: Optional[int] = None,
+                 antenna_signals_quantized: Optional[torch.Tensor] = None,
+                 beamformer = None):
         """
         Initialize Water-Filling optimizer.
 
@@ -458,6 +461,9 @@ class WaterFilling:
             tolerance: Convergence threshold for power change
             verbose: Print optimization progress
             device: Computation device ('cpu', 'cuda', 'mps')
+            num_bits: Number of DAC bits. None for continuous (default), 1 for 1-bit quantization
+            antenna_signals_quantized: (M,) tensor - quantized antenna signals (required if num_bits=1)
+            beamformer: Beamformer object (required if num_bits=1 for channel access)
         """
         self.H_eff = H_eff.detach() if isinstance(H_eff, torch.Tensor) else H_eff
         self.noise_power = noise_power
@@ -468,6 +474,16 @@ class WaterFilling:
         self.device = device
         self.K = H_eff.shape[0]
         self.sinr = []
+
+        # 1-bit DAC support
+        self.num_bits = num_bits
+        self.antenna_signals_quantized = antenna_signals_quantized
+        self.beamformer = beamformer
+
+        # Validate 1-bit parameters
+        if self.num_bits == 1:
+            if self.antenna_signals_quantized is None or self.beamformer is None:
+                raise ValueError("For num_bits=1, must provide antenna_signals_quantized and beamformer")
 
         # Channel gains |H_eff[k,k]|^2 for each user
         self.channel_gains = torch.abs(torch.diag(self.H_eff))**2
@@ -867,15 +883,49 @@ class DDPG:
                  hidden_dim: int = 256, actor_lr: float = 1e-4, critic_lr: float = 1e-3,
                  gamma: float = 0.99, tau: float = 0.005, buffer_size: int = 100000,
                  batch_size: int = 64, noise_std: float = 0.1,
-                 optimize_target: str = 'phases', verbose: bool = True):
+                 optimize_target: str = 'phases', verbose: bool = True,
+                 device: Optional[str] = None):
         """
+        Initialize DDPG agent for beamforming optimization.
+
         Args:
-            optimize_target: What to optimize - 'phases' or 'power'
+            beamformer (Beamformer): The beamformer system to optimize
+            state_dim (int): Dimension of state space. Typically 2*K*N + K for SIM (K users, N metaatoms)
+                             State = [channel_H.real, channel_H.imag, power_allocation]
+            action_dim (int): Dimension of action space. Typically L*N for phase optimization (L layers, N metaatoms)
+                              Action = SIM phases to apply
+
+            hidden_dim (int): Number of hidden units in actor/critic networks. Default 256
+            actor_lr (float): Learning rate for actor network. Default 1e-4
+            critic_lr (float): Learning rate for critic network. Default 1e-3
+
+            gamma (float): Discount factor for future rewards [0, 1]. Default 0.99
+                          How much the agent values future rewards vs immediate rewards
+            tau (float): Soft update coefficient for target networks [0, 1]. Default 0.005
+                        target_weight = tau * online_weight + (1-tau) * target_weight
+                        Smaller tau = slower, more stable updates
+
+            buffer_size (int): Maximum size of replay buffer. Default 100000
+                              Stores (state, action, reward, next_state, done) transitions
+            batch_size (int): Mini-batch size for training. Default 64
+                             Number of samples to use per gradient update
+            noise_std (float): Standard deviation of exploration noise added to actions. Default 0.1
+                              Helps agent explore action space during training
+
+            optimize_target (str): What to optimize - 'phases' or 'power'. Default 'phases'
                 - 'phases': optimize SIM phases (action_dim = L*N)
                 - 'power': optimize power allocation (action_dim = K)
+            verbose (bool): Print training progress. Default True
+
+            device (str): Device for all operations ('cpu', 'cuda', 'mps'). Default None (uses beamformer's device)
+                         All neural networks and tensors will be on this device
         """
         self.beamformer = beamformer
-        self.device = beamformer.device
+        self.device = device if device is not None else beamformer.device
+
+        # Move beamformer tensors to device if needed
+        if self.device != beamformer.device:
+            self.beamformer.to_device(self.device)
         self.action_dim = action_dim
         self.optimize_target = optimize_target
         self.gamma = gamma
@@ -1049,6 +1099,110 @@ class DDPG:
 
         return {'optimal_params': best_params, 'optimal_objective': best_reward, 'history': self.history}
 
+    def save_weights(self, path: str):
+        """Save agent weights to disk."""
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'actor_target_state_dict': self.actor_target.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'critic_target_state_dict': self.critic_target.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'history': self.history,
+        }, path)
+        if self.verbose:
+            print(f"DDPG weights saved to {path}")
+
+    def load_weights(self, path: str):
+        """Load agent weights from disk."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        if 'history' in checkpoint:
+            self.history = checkpoint['history']
+        if self.verbose:
+            print(f"DDPG weights loaded from {path}")
+
+    def optimize_with_policy(self, initial_phases: torch.Tensor,
+                            power_allocation: torch.Tensor,
+                            num_iterations: int = 5000,
+                            early_stopping_patience: int = 100) -> Dict:
+        """
+        Use trained policy to optimize phases via iterative policy rollout.
+        This is for inference/deployment, not training. No exploration noise.
+
+        Args:
+            initial_phases: Starting phases (L, N)
+            power_allocation: Fixed power allocation (K,)
+            num_iterations: Number of optimization iterations
+            early_stopping_patience: Stop if no improvement for this many iterations
+
+        Returns:
+            Dictionary with 'optimal_params', 'optimal_objective', 'history'
+        """
+        power_allocation_fixed = power_allocation.to(self.device)
+
+        # Start from initial phases
+        current_phases = initial_phases.clone().to(self.device)
+        best_phases = current_phases.clone()
+
+        # Evaluate initial
+        best_reward = self.beamformer.compute_sum_rate(current_phases, power_allocation_fixed).item()
+
+        no_improvement_count = 0
+        iteration_rewards = []
+
+        for iteration in range(num_iterations):
+            # Get state from current channel, power, and current phases
+            H_eff = self.beamformer.H.flatten()
+            state = torch.cat([H_eff.real, H_eff.imag, power_allocation_fixed, current_phases.flatten()]).cpu().numpy()
+
+            # Use policy to get next action (NO NOISE - pure exploitation)
+            action = self.select_action(state, add_noise=False)
+
+            # Convert action to phases
+            phases = torch.FloatTensor(action).reshape(
+                self.beamformer.sim_model.layers,
+                self.beamformer.sim_model.metaAtoms
+            ).to(self.device)
+
+            # Evaluate
+            reward = self.beamformer.compute_sum_rate(phases, power_allocation_fixed).item()
+            iteration_rewards.append(reward)
+
+            # Track best
+            if reward > best_reward:
+                best_reward = reward
+                best_phases = phases.clone()
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+
+            # Update current phases for next iteration
+            current_phases = phases
+
+            # Early stopping
+            if no_improvement_count >= early_stopping_patience:
+                if self.verbose:
+                    print(f"Early stopping at iteration {iteration} (no improvement for {early_stopping_patience} iterations)")
+                break
+
+            if self.verbose and iteration % 500 == 0:
+                print(f"Iteration {iteration:5d} | Current: {reward:10.4f} | Best: {best_reward:10.4f}")
+
+        if self.verbose:
+            print(f"\nPolicy optimization complete. Best sum-rate: {best_reward:.6f} bits/s/Hz\n")
+
+        return {
+            'optimal_params': best_phases,
+            'optimal_objective': best_reward,
+            'history': {'iteration_rewards': iteration_rewards}
+        }
+
 
 class TD3:
     """Twin Delayed DDPG for SIM phase optimization."""
@@ -1056,16 +1210,56 @@ class TD3:
                  hidden_dim: int = 256, actor_lr: float = 1e-4, critic_lr: float = 1e-3,
                  gamma: float = 0.99, tau: float = 0.005, policy_noise: float = 0.2,
                  noise_clip: float = 0.5, policy_delay: int = 2, buffer_size: int = 100000,
-                 batch_size: int = 64, noise_std: float = 0.1, verbose: bool = True):
+                 batch_size: int = 64, noise_std: float = 0.1, verbose: bool = True,
+                 device: Optional[str] = None):
         """
+        Initialize TD3 (Twin Delayed DDPG) agent for beamforming optimization.
+        TD3 uses two critic networks and delayed policy updates for improved stability.
+
         Args:
-            beamformer: Beamformer instance
-            state_dim: Dimension of state space (2*K*N + K for channel + power)
-            action_dim: Dimension of action space (L*N for phases)
-            noise_std: Standard deviation for exploration noise
+            beamformer (Beamformer): The beamformer system to optimize
+            state_dim (int): Dimension of state space. Typically 2*K*N + K for SIM (K users, N metaatoms)
+                             State = [channel_H.real, channel_H.imag, power_allocation]
+            action_dim (int): Dimension of action space. Typically L*N for phase optimization (L layers, N metaatoms)
+                              Action = SIM phases to apply
+
+            hidden_dim (int): Number of hidden units in actor/critic networks. Default 256
+            actor_lr (float): Learning rate for actor network. Default 1e-4
+            critic_lr (float): Learning rate for critic network. Default 1e-3
+
+            gamma (float): Discount factor for future rewards [0, 1]. Default 0.99
+                          How much the agent values future rewards vs immediate rewards
+            tau (float): Soft update coefficient for target networks [0, 1]. Default 0.005
+                        target_weight = tau * online_weight + (1-tau) * target_weight
+                        Smaller tau = slower, more stable updates
+
+            policy_noise (float): Std dev of target policy smoothing noise. Default 0.2
+                                 Noise added to target actions to prevent exploiting Q-value errors
+            noise_clip (float): Range for clipping target policy noise. Default 0.5
+                               Noise clipped to [-noise_clip, noise_clip]
+
+            policy_delay (int): Update actor every N critic updates. Default 2
+                              TD3 delays actor updates to let critic stabilize
+                              Example: policy_delay=2 means update actor every 2 critic updates
+
+            buffer_size (int): Maximum size of replay buffer. Default 100000
+                              Stores (state, action, reward, next_state, done) transitions
+            batch_size (int): Mini-batch size for training. Default 64
+                             Number of samples to use per gradient update
+            noise_std (float): Standard deviation of exploration noise added to actions. Default 0.1
+                              Helps agent explore action space during training
+
+            verbose (bool): Print training progress. Default True
+
+            device (str): Device for all operations ('cpu', 'cuda', 'mps'). Default None (uses beamformer's device)
+                         All neural networks and tensors will be on this device
         """
         self.beamformer = beamformer
-        self.device = beamformer.device
+        self.device = device if device is not None else beamformer.device
+
+        # Move beamformer tensors to device if needed
+        if self.device != beamformer.device:
+            self.beamformer.to_device(self.device)
         self.action_dim = action_dim
         self.gamma = gamma
         self.tau = tau
@@ -1240,3 +1434,302 @@ class TD3:
             print(f"\nBest sum-rate: {best_reward:.6f} bits/s/Hz\n")
 
         return {'optimal_params': best_params, 'optimal_objective': best_reward, 'history': self.history}
+
+    def save_weights(self, path: str):
+        """Save agent weights to disk."""
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'actor_target_state_dict': self.actor_target.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'critic_target_state_dict': self.critic_target.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'history': self.history,
+        }, path)
+        if self.verbose:
+            print(f"TD3 weights saved to {path}")
+
+    def load_weights(self, path: str):
+        """Load agent weights from disk."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        if 'history' in checkpoint:
+            self.history = checkpoint['history']
+        if self.verbose:
+            print(f"TD3 weights loaded from {path}")
+
+    def optimize_with_policy(self, initial_phases: torch.Tensor,
+                            power_allocation: torch.Tensor,
+                            num_iterations: int = 5000,
+                            early_stopping_patience: int = 100) -> Dict:
+        """
+        Use trained policy to optimize phases via iterative policy rollout.
+        This is for inference/deployment, not training. No exploration noise.
+
+        Args:
+            initial_phases: Starting phases (L, N)
+            power_allocation: Fixed power allocation (K,)
+            num_iterations: Number of optimization iterations
+            early_stopping_patience: Stop if no improvement for this many iterations
+
+        Returns:
+            Dictionary with 'optimal_params', 'optimal_objective', 'history'
+        """
+        power_allocation_fixed = power_allocation.to(self.device)
+
+        # Start from initial phases
+        current_phases = initial_phases.clone().to(self.device)
+        best_phases = current_phases.clone()
+
+        # Evaluate initial
+        best_reward = self.beamformer.compute_sum_rate(current_phases, power_allocation_fixed).item()
+
+        no_improvement_count = 0
+        iteration_rewards = []
+
+        for iteration in range(num_iterations):
+            # Get state from current channel, power, and current phases
+            H_eff = self.beamformer.H.flatten()
+            state = torch.cat([H_eff.real, H_eff.imag, power_allocation_fixed, current_phases.flatten()]).cpu().numpy()
+
+            # Use policy to get next action (NO NOISE - pure exploitation)
+            action = self.select_action(state, add_noise=False)
+
+            # Convert action to phases
+            phases = torch.FloatTensor(action).reshape(
+                self.beamformer.sim_model.layers,
+                self.beamformer.sim_model.metaAtoms
+            ).to(self.device)
+
+            # Evaluate
+            reward = self.beamformer.compute_sum_rate(phases, power_allocation_fixed).item()
+            iteration_rewards.append(reward)
+
+            # Track best
+            if reward > best_reward:
+                best_reward = reward
+                best_phases = phases.clone()
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+
+            # Update current phases for next iteration
+            current_phases = phases
+
+            # Early stopping
+            if no_improvement_count >= early_stopping_patience:
+                if self.verbose:
+                    print(f"Early stopping at iteration {iteration} (no improvement for {early_stopping_patience} iterations)")
+                break
+
+            if self.verbose and iteration % 500 == 0:
+                print(f"Iteration {iteration:5d} | Current: {reward:10.4f} | Best: {best_reward:10.4f}")
+
+        if self.verbose:
+            print(f"\nPolicy optimization complete. Best sum-rate: {best_reward:.6f} bits/s/Hz\n")
+
+        return {
+            'optimal_params': best_phases,
+            'optimal_objective': best_reward,
+            'history': {'iteration_rewards': iteration_rewards}
+        }
+
+
+# ========== 1-Bit DAC Precoding ==========
+
+def quantize_to_1bit(signal):
+    """
+    Quantize complex signal to 1-bit discrete set: {±1±j}
+
+    Args:
+        signal: (N,) complex tensor - continuous signal
+
+    Returns:
+        (N,) complex tensor - quantized to {-1-j, -1+j, 1-j, 1+j}
+    """
+    real_part = torch.sign(torch.real(signal))
+    imag_part = torch.sign(torch.imag(signal))
+
+    # Handle zeros (map to +1 by default)
+    real_part = torch.where(real_part == 0, torch.ones_like(real_part), real_part)
+    imag_part = torch.where(imag_part == 0, torch.ones_like(imag_part), imag_part)
+
+    return real_part + 1j * imag_part
+
+
+class CG_MC1bit:
+    """
+    Convergence-Guaranteed Multi-Carrier 1-bit Precoding (CG-MC1bit)
+
+    Based on Algorithm 1 from:
+    Wen et al., "One-Bit Downlink Precoding for Massive MIMO OFDM System"
+    IEEE Trans. Wireless Commun., Vol. 22, No. 9, September 2023
+
+    Solves the non-convex optimization problem:
+        minimize: MSE = Σ_k ||s[k] - A·H[k]·x[k]||²₂ + Nσ²Σα_i²
+        subject to: x[k] ∈ {±1±j} for all k (1-bit DAC constraint)
+
+    Uses modified ADMM (Alternating Direction Method of Multipliers) with:
+        - Convergence guarantee when λ > √(2·Lϕ)
+        - Nonlinear precoding that accounts for quantization
+        - Per-user adjustment factors for different path losses
+
+    Key Features:
+        - Handles OFDM multi-carrier systems
+        - Accounts for 1-bit DAC quantization during optimization (not after)
+        - Supports users with different channel conditions
+        - Guaranteed convergence to stationary point
+    """
+
+    def __init__(self, beamformer, lambda_penalty=0.01, max_iterations=100,
+                 tolerance=1e-6, verbose=False, device='cpu'):
+        """
+        Initialize CG-MC1bit optimizer.
+
+        Args:
+            beamformer: Beamformer object with channel H
+            lambda_penalty: ADMM penalty factor (must be > √(2·Lϕ) for convergence)
+                          Typical value: 0.01 - 0.1
+            max_iterations: Maximum ADMM iterations (typically 50-200)
+            tolerance: Convergence tolerance for MSE change
+            verbose: Print iteration details
+            device: 'cpu', 'cuda', or 'mps'
+        """
+        self.beamformer = beamformer
+        self.lambda_penalty = lambda_penalty
+        self.max_iterations = max_iterations
+        self.tolerance = tolerance
+        self.verbose = verbose
+        self.device = device
+
+        self.H = beamformer.H.to(device)  # (K, M) channel matrix
+        self.K, self.M = self.H.shape
+        self.noise_power = beamformer.noise_power
+
+    def optimize(self, symbols, total_power):
+        """
+        Run CG-MC1bit optimization to find 1-bit precoded signals.
+
+        Args:
+            symbols: (K,) tensor - input symbols per user (e.g., QPSK, QAM)
+            total_power: Scalar - total transmit power constraint
+
+        Returns:
+            dict: {
+                'antenna_signals': (M,) complex tensor - quantized to {±1±j},
+                'alpha': (K,) tensor - per-user adjustment factors,
+                'mse_history': list - MSE value at each iteration,
+                'converged': bool - whether algorithm converged,
+                'iterations': int - number of iterations used
+            }
+        """
+        symbols = symbols.to(self.device)
+
+        # ========== Initialize ADMM Variables ==========
+        # X: continuous antenna signals (primal variable, frequency domain)
+        # R: auxiliary variable (will be quantized to enforce 1-bit constraint)
+        # V: dual variable (Lagrange multiplier for constraint X = R)
+        # alpha: per-user adjustment factors (accounts for different path losses)
+
+        X = torch.ones(self.M, dtype=torch.complex64, device=self.device)
+        R = X.clone()
+        V = torch.zeros(self.M, dtype=torch.complex64, device=self.device)
+        alpha = torch.ones(self.K, device=self.device) * 0.01  # Small initial value
+
+        mse_history = []
+
+        # ========== ADMM Iterations ==========
+        for t in range(self.max_iterations):
+            X_old = X.clone()
+
+            # ===== Step 1: Update X (Continuous Precoding Variable) =====
+            # Minimize: ||s - A·H·x||² + (λ/2)||x - R + V/λ||²
+            # Solution: x = (2H^H·H + λI)^(-1) · (2H^H·s + λR - V)
+            #
+            # H_tilde = diag(α) @ H accounts for per-user scaling
+
+            # Convert alpha to complex for matrix multiplication with complex H
+            H_tilde = torch.diag(alpha.to(torch.complex64)) @ self.H  # (K, M) weighted channel
+
+            # Build linear system: (2H^H·H + λI) x = (2H^H·s + λR - V)
+            term1 = 2 * H_tilde.conj().T @ H_tilde + self.lambda_penalty * torch.eye(
+                self.M, dtype=torch.complex64, device=self.device
+            )
+            term2 = (2 * H_tilde.conj().T @ symbols) + (self.lambda_penalty * R) - V
+
+            # Solve for X (closed-form solution, equation 17 from paper)
+            X = torch.linalg.solve(term1, term2)
+
+            # ===== Step 2: Update R (1-Bit Quantization/Projection) =====
+            # Project: R = P_A(X + V/λ) where A = {±1±j}
+            # This is the CRITICAL step that enforces the 1-bit DAC constraint
+            #
+            # Projection simply: sign(real) + j·sign(imag)
+
+            temp = X + V / self.lambda_penalty
+            R = quantize_to_1bit(temp)
+
+            # ===== Step 3: Update Dual Variable V =====
+            # Dual ascent: V^(t+1) = V^t + λ(X^(t+1) - R^(t+1))
+            # Enforces constraint X = R through penalty
+
+            V = V + (self.lambda_penalty * (X - R))
+
+            # ===== Step 4: Update Per-User Adjustment Factors α =====
+            # α_i = Re(R^H · h_i · s_i) / (||h_i · R||² + σ²)
+            # Accounts for users with different channel conditions/path losses
+            #
+            # From equation (22) in paper
+
+            for i in range(self.K):
+                h_i = self.H[i, :]  # (M,) channel for user i
+                # FIX: Symbol should be conjugated in alpha formula
+                # α_i = Re(s_i · R^H · h_i) / (|h_i · R|² + σ²)
+                numerator = torch.real(torch.conj(R).T * h_i * symbols[i])
+                denominator = (torch.conj(R).T * h_i * torch.conj(h_i).T * R) + self.noise_power
+                alpha[i] = torch.sum(numerator) / torch.sum(denominator)
+
+            # ===== Compute MSE for Monitoring =====
+            # MSE = ||s - A·H·R||² + σ²·Σα_i²
+
+            H_tilde = torch.diag(alpha.to(torch.complex64)) @ self.H
+            mse = torch.sum(torch.norm(symbols - H_tilde @ R)**2) + self.noise_power * torch.sum(alpha**2)
+            mse_history.append(mse.item())
+
+            # ===== Check Convergence =====
+            # Stop if X doesn't change significantly
+
+            change = torch.norm(X - X_old).item()
+            if change < self.tolerance:
+                if self.verbose:
+                    print(f"   CG-MC1bit converged at iteration {t+1}")
+                break
+
+            if self.verbose and t % 20 == 0:
+                print(f"   Iter {t}: MSE={mse.item():.6f}, change={change:.6e}")
+
+        # ========== Post-Processing: Power Normalization ==========
+        # Normalize R to satisfy total power constraint
+        # γ = P_total / ||R||²
+
+        gamma = total_power / torch.sum(torch.abs(R)**2)
+        R_normalized = torch.sqrt(gamma) * R
+
+        converged = (t < self.max_iterations - 1)
+
+        if self.verbose:
+            print(f"   CG-MC1bit finished: {t+1} iterations, "
+                  f"converged={converged}, final MSE={mse_history[-1]:.6f}")
+
+        return {
+            'antenna_signals': R_normalized,
+            'alpha': alpha,
+            'mse_history': mse_history,
+            'converged': converged,
+            'iterations': t + 1
+        }

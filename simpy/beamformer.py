@@ -185,8 +185,10 @@ class Beamformer(Transceiver, UserChannel):
         """
         if self.sim_model is not None:
             # Compute scaling factors using Frobenius norm
-            self.A_scale = torch.norm(self.A)
-            self.H_scale = torch.norm(self.H)
+            # For complex tensors: compute norm of absolute values
+            # Ensure scale factors stay on the same device as the tensors
+            self.A_scale = torch.norm(torch.abs(self.A)).to(self.device)
+            self.H_scale = torch.norm(torch.abs(self.H)).to(self.device)
 
             # Check for degenerate cases
             if self.A_scale < 1e-12:
@@ -198,7 +200,9 @@ class Beamformer(Transceiver, UserChannel):
             self.channel_scale = self.H_scale * self.A_scale
         else:
             # Digital-only case (no SIM)
-            self.H_scale = torch.norm(self.H)
+            # For complex tensors: compute norm of absolute values
+            # Ensure scale factor stays on the same device
+            self.H_scale = torch.norm(torch.abs(self.H)).to(self.device)
             if self.H_scale < 1e-12:
                 raise ValueError(f"Channel H norm too small: {self.H_scale:.4e}")
             self.channel_scale = self.H_scale
@@ -210,8 +214,13 @@ class Beamformer(Transceiver, UserChannel):
         Also recomputes normalization factors.
         """
         if not self.use_nearfield_user_channel:
-            sim_last_layer = self.sim_model.get_last_layer_positions()
-            self.H = self.generate_channel(sim_last_layer, time=time)  # From UserChannel
+            if self.sim_model is not None:
+                # With SIM: channel from SIM last layer to users
+                sim_last_layer = self.sim_model.get_last_layer_positions()
+                self.H = self.generate_channel(sim_last_layer, time=time)  # From UserChannel
+            else:
+                # Without SIM: channel from antennas to users
+                self.H = self.generate_channel(self.antenna_positions, time=time)
             # Recompute normalization with new H
             self._compute_channel_normalization()
 
@@ -422,3 +431,30 @@ class Beamformer(Transceiver, UserChannel):
                 'channel_H_shape': tuple(self.H.shape)
             })
         return info
+
+    def to_device(self, device: str):
+        """
+        Move all beamformer tensors to specified device.
+
+        Args:
+            device: Target device ('cpu', 'cuda', 'mps')
+        """
+        self.device = device
+
+        # Move channel matrices
+        if hasattr(self, 'H') and self.H is not None:
+            self.H = self.H.to(device)
+        if hasattr(self, 'A') and self.A is not None:
+            self.A = self.A.to(device)
+
+        # Move scaling factors
+        if hasattr(self, 'H_scale') and self.H_scale is not None:
+            self.H_scale = self.H_scale.to(device) if isinstance(self.H_scale, torch.Tensor) else self.H_scale
+        if hasattr(self, 'A_scale') and self.A_scale is not None:
+            self.A_scale = self.A_scale.to(device) if isinstance(self.A_scale, torch.Tensor) else self.A_scale
+        if hasattr(self, 'channel_scale') and self.channel_scale is not None:
+            self.channel_scale = self.channel_scale.to(device) if isinstance(self.channel_scale, torch.Tensor) else self.channel_scale
+
+        # Move SIM model tensors
+        if self.sim_model is not None:
+            self.sim_model.to_device(device)

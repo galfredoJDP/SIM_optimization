@@ -169,37 +169,99 @@ class Beamformer(Transceiver, UserChannel):
             # Far-field: Use statistical channel model
             self.H = self.generate_channel(sim_last_layer, time=0.0)  # From UserChannel
 
+        # Compute and store normalization factors for numerical stability
+        self._compute_channel_normalization()
+
+    def _compute_channel_normalization(self):
+        """
+        Compute and store channel scaling factors for numerical stability.
+
+        Stores normalization factors but keeps H and A as the actual (unnormalized) channels.
+        Normalization is applied on-the-fly during channel computations.
+
+        Stores:
+            - H_scale, A_scale: Individual channel norms
+            - channel_scale: Combined scaling factor (H_scale * A_scale)
+        """
+        if self.sim_model is not None:
+            # Compute scaling factors using Frobenius norm
+            # For complex tensors: compute norm of absolute values
+            # Ensure scale factors stay on the same device as the tensors
+            self.A_scale = torch.norm(torch.abs(self.A)).to(self.device)
+            self.H_scale = torch.norm(torch.abs(self.H)).to(self.device)
+
+            # Check for degenerate cases
+            if self.A_scale < 1e-12:
+                raise ValueError(f"Channel A norm too small: {self.A_scale:.4e}")
+            if self.H_scale < 1e-12:
+                raise ValueError(f"Channel H norm too small: {self.H_scale:.4e}")
+
+            # Combined scale factor for end-to-end channel
+            self.channel_scale = self.H_scale * self.A_scale
+        else:
+            # Digital-only case (no SIM)
+            # For complex tensors: compute norm of absolute values
+            # Ensure scale factor stays on the same device
+            self.H_scale = torch.norm(torch.abs(self.H)).to(self.device)
+            if self.H_scale < 1e-12:
+                raise ValueError(f"Channel H norm too small: {self.H_scale:.4e}")
+            self.channel_scale = self.H_scale
+            self.A_scale = None
+
     def update_user_channel(self, time: float = 0.0):
-        """Update user channel H for time-varying channels with mobility."""
+        """
+        Update user channel H for time-varying channels with mobility.
+        Also recomputes normalization factors.
+        """
         if not self.use_nearfield_user_channel:
-            sim_last_layer = self.sim_model.get_last_layer_positions()
-            self.H = self.generate_channel(sim_last_layer, time=time)  # From UserChannel
+            if self.sim_model is not None:
+                # With SIM: channel from SIM last layer to users
+                sim_last_layer = self.sim_model.get_last_layer_positions()
+                self.H = self.generate_channel(sim_last_layer, time=time)  # From UserChannel
+            else:
+                # Without SIM: channel from antennas to users
+                self.H = self.generate_channel(self.antenna_positions, time=time)
+            # Recompute normalization with new H
+            self._compute_channel_normalization()
 
     def compute_end_to_end_channel(self, phases: torch.Tensor = None, direction : str = 'down') -> torch.Tensor:
         """
         Compute end-to-end channel: H_eff = H @ Ψ @ A
 
+        Uses channel normalization for numerical stability during computation.
+
         Args:
             phases: (L, N) SIM phase configuration
+            direction: 'down' for downlink or 'up' for uplink
 
         Returns:
             H_eff: (K, A) end-to-end channel from antennas to users
         """
         if phases is not None:
-            self.sim_model.update_phases(phases)
-            Psi = self.sim_model.simChannel()
-            # Use complex_matmul for MPS compatibility
-            H_eff = complex_matmul(complex_matmul(self.H, Psi), self.A)
+            # Normalize channels for numerical stability
+            H_norm = self.H / self.H_scale
+            A_norm = self.A / self.A_scale
+
+            # Compute effective channel with normalized channels
+            Psi = self.sim_model.forward(phases)  # Maintains gradient flow!
+            H_eff_norm = complex_matmul(complex_matmul(H_norm, Psi), A_norm)
+
+            # Scale back to get actual effective channel
+            H_eff = H_eff_norm * self.channel_scale
         else:
+            # Digital-only case (no SIM)
             H_eff = self.H
+
         if direction == 'up':
-            H_eff = torch.conj(H_eff).T #Hermittian for uplink, assume reciprocity
+            H_eff = torch.conj(H_eff).T  # Hermitian for uplink, assume reciprocity
+
         return H_eff
 
     def compute_sinr(self,
                      phases: torch.Tensor = None, #the SIM weights
                      power_allocation: Optional[torch.Tensor] = None,
-                     digital_beamforming_weights : Optional[torch.Tensor] = None) -> torch.Tensor:
+                     digital_beamforming_weights : Optional[torch.Tensor] = None,
+                     debug: bool = False) -> torch.Tensor:
         """
         Actually computes the channel first then computes the SINR. Could handle SIM-only, digital-only, or hybrid.
 
@@ -207,6 +269,7 @@ class Beamformer(Transceiver, UserChannel):
             phases: (L, N) SIM phase configuration. If None, assumes digital beamforming only .
             power_allocation: (K,) power allocation. If None, uses equal power.
             digital_beamforming_weights: (M, K) digital beamforming weights. If None, assumes SIM-only.
+            debug: if True, print debug information
 
         Returns:
             sinr: (K,) SINR for each user
@@ -229,7 +292,7 @@ class Beamformer(Transceiver, UserChannel):
             effective_channel = H_eff
 
         # Compute SINR (this will save last_effective_channel in compute_sinr_downlink)
-        sinr = self.compute_sinr_downlink(effective_channel, power_allocation, self.noise_power)  # From Transceiver
+        sinr = self.compute_sinr_downlink(effective_channel, power_allocation, self.noise_power, debug=debug)  # From Transceiver
         return sinr
 
     def compute_sum_rate(self, phases: torch.Tensor,
@@ -283,6 +346,7 @@ class Beamformer(Transceiver, UserChannel):
 
         """
         pass
+    
     def get_sim_phase_objective(self, power_allocation: Optional[torch.Tensor] = None):
         """
         SIM-only: Optimize phases, power fixed, no digital weights.
@@ -367,3 +431,30 @@ class Beamformer(Transceiver, UserChannel):
                 'channel_H_shape': tuple(self.H.shape)
             })
         return info
+
+    def to_device(self, device: str):
+        """
+        Move all beamformer tensors to specified device.
+
+        Args:
+            device: Target device ('cpu', 'cuda', 'mps')
+        """
+        self.device = device
+
+        # Move channel matrices
+        if hasattr(self, 'H') and self.H is not None:
+            self.H = self.H.to(device)
+        if hasattr(self, 'A') and self.A is not None:
+            self.A = self.A.to(device)
+
+        # Move scaling factors
+        if hasattr(self, 'H_scale') and self.H_scale is not None:
+            self.H_scale = self.H_scale.to(device) if isinstance(self.H_scale, torch.Tensor) else self.H_scale
+        if hasattr(self, 'A_scale') and self.A_scale is not None:
+            self.A_scale = self.A_scale.to(device) if isinstance(self.A_scale, torch.Tensor) else self.A_scale
+        if hasattr(self, 'channel_scale') and self.channel_scale is not None:
+            self.channel_scale = self.channel_scale.to(device) if isinstance(self.channel_scale, torch.Tensor) else self.channel_scale
+
+        # Move SIM model tensors
+        if self.sim_model is not None:
+            self.sim_model.to_device(device)

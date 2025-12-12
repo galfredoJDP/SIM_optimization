@@ -133,10 +133,12 @@ class Beamformer(Transceiver, UserChannel):
 
     def _compute_static_channels(self):
         """
-        Precompute static channel matrices A and H.
+        Precompute static channel matrices A and H with normalization.
 
         A: Antenna → SIM first layer (doesn't change)
         H: SIM last layer → Users (can be time-varying)
+
+        Stores both original and normalized versions for numerical stability.
         """
         # Channel A: Antenna → SIM first layer (Rayleigh-Sommerfeld)
         antenna_positions = self.get_positions().cpu().numpy()  # From Transceiver
